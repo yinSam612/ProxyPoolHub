@@ -95,6 +95,7 @@ class LogManager {
 
         this.initDirs();
         this.loadTrafficStats();
+        this.loadRecentLogsFromDisk();
         this.cleanExpiredLogs();
 
         // 每天凌晨定时轮转与清理
@@ -128,6 +129,29 @@ class LogManager {
                         this.trafficStats.set(Number(port), item);
                     }
                 }
+            }
+        } catch (error) {
+            // 容错处理
+        }
+    }
+
+    /**
+     * 启动时从最新磁盘日志文件恢复最近记录到内存队列
+     */
+    loadRecentLogsFromDisk() {
+        try {
+            const today = getTodayDateString();
+            const filePath = path.join(this.logDir, `access-${today}.log`);
+            if (fs.existsSync(filePath)) {
+                const content = fs.readFileSync(filePath, 'utf8');
+                const lines = content.trim().split('\n').filter(Boolean);
+                const loaded = [];
+                for (let i = lines.length - 1; i >= 0 && loaded.length < this.maxMemoryLogs; i--) {
+                    try {
+                        loaded.push(JSON.parse(lines[i]));
+                    } catch (e) {}
+                }
+                this.recentLogs = loaded;
             }
         } catch (error) {
             // 容错处理

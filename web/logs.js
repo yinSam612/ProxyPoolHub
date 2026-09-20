@@ -95,11 +95,13 @@ async function api(url, options = {}) {
 async function loadNodes() {
   try {
     const data = await api('/api/proxies');
-    state.proxies = data.proxies || [];
+    state.proxies = Array.isArray(data) ? data : (data.proxies || []);
     const currentVal = el.nodeSelect.value;
     const options = ['<option value="">全部节点 (全部端口)</option>'];
     for (const item of state.proxies) {
-      const label = `${item.listenPort} · ${item.name || item.server || '未命名'} (${item.type})`;
+      const loc = item.location ? ` [${item.location.split(' / ').slice(-1)[0] || item.location}]` : '';
+      const name = item.name || item.server || '节点';
+      const label = `${item.listenPort} · ${name}${loc}`;
       options.push(`<option value="${item.listenPort}"${currentVal === String(item.listenPort) ? ' selected' : ''}>${escapeHtml(label)}</option>`);
     }
     el.nodeSelect.innerHTML = options.join('');
@@ -207,10 +209,12 @@ function renderTable(logs) {
   if (!logs.length) {
     el.logsTableBody.innerHTML = `
       <tr>
-        <td colspan="6" class="logs-empty-state">
-          <div class="empty-icon">📭</div>
-          <div class="empty-title">暂无连接记录</div>
-          <div class="empty-desc">当前筛选条件下未捕获到客户端连接，新连接建立后将实时在此显现。</div>
+        <td colspan="6" class="logs-empty-cell">
+          <div class="logs-empty-box">
+            <div class="icon">📭</div>
+            <div class="title">暂无匹配的连接记录</div>
+            <div class="desc">当前节点或过滤条件下未捕获到客户端连接，新连接建立后将实时在此显现。</div>
+          </div>
         </td>
       </tr>
     `;
@@ -237,35 +241,44 @@ function renderTable(logs) {
       }
     }
 
-    // 查找节点名称备注
-    const matchedProxy = state.proxies.find((p) => Number(p.listenPort) === Number(log.listenPort));
-    const nodeLabel = matchedProxy ? (matchedProxy.name || matchedProxy.server || '节点') : '节点';
+    // 查找节点名称备注与地理归属
+    const hasPort = Boolean(log.listenPort && Number(log.listenPort) > 0);
+    const matchedProxy = hasPort ? state.proxies.find((p) => Number(p.listenPort) === Number(log.listenPort)) : null;
+    const locationText = matchedProxy && matchedProxy.location ? matchedProxy.location : '';
+    const nodeName = matchedProxy ? (matchedProxy.name || matchedProxy.server || '节点') : '';
+    const displayTag = locationText ? locationText.split(' / ').slice(-1)[0] : (nodeName || '通用节点');
+    const fullTooltip = locationText ? `${nodeName} · 出口归属: ${locationText}` : (nodeName || '代理节点');
+
+    const nodeCellHtml = hasPort
+      ? `<span class="log-port-chip font-mono">:${log.listenPort}</span>
+         <span class="log-node-label" title="${escapeHtml(fullTooltip)}">${escapeHtml(displayTag)}</span>`
+      : `<span class="log-direct-chip">系统直连</span>
+         <span class="log-node-label" style="color:var(--text-muted)" title="统一网关/核心直接转发">核心网关</span>`;
 
     return `
       <tr class="log-row">
-        <td class="col-time" title="${escapeHtml(fullDate)}">
-          <span class="time-badge font-mono">${escapeHtml(timeStr)}</span>
+        <td title="${escapeHtml(fullDate)}">
+          <span class="log-time-chip font-mono">${escapeHtml(timeStr)}</span>
         </td>
-        <td class="col-node">
-          <div class="node-badge-group">
-            <span class="port-chip font-mono">:${log.listenPort || '-'}</span>
-            <span class="node-name-tip" title="${escapeHtml(nodeLabel)}">${escapeHtml(nodeLabel)}</span>
+        <td>
+          <div class="log-node-cell">
+            ${nodeCellHtml}
           </div>
         </td>
-        <td class="col-client font-mono">
-          <span class="client-pill" title="客户端来源 IP 及端口">${escapeHtml(log.client || '-')}</span>
+        <td>
+          <span class="log-client-pill font-mono" title="客户端来源 IP 及端口">${escapeHtml(log.client || '-')}</span>
         </td>
-        <td class="col-target font-mono">
-          <span class="target-link" title="${escapeHtml(log.target || '-')}">${escapeHtml(log.target || '-')}</span>
+        <td>
+          <span class="log-target-cell font-mono" title="${escapeHtml(log.target || '-')}">${escapeHtml(log.target || '-')}</span>
         </td>
-        <td class="col-traffic font-mono">
-          <div class="traffic-dual-badge">
-            <span class="up-tag" title="上行请求数据量">↑ ${escapeHtml(log.uploadFormatted || '0 B')}</span>
-            <span class="down-tag" title="下行响应数据量">↓ ${escapeHtml(log.downloadFormatted || '0 B')}</span>
+        <td>
+          <div class="log-traffic-group font-mono">
+            <span class="up" title="上行请求数据量">↑ ${escapeHtml(log.uploadFormatted || '0 B')}</span>
+            <span class="down" title="下行响应数据量">↓ ${escapeHtml(log.downloadFormatted || '0 B')}</span>
           </div>
         </td>
-        <td class="col-duration font-mono">
-          <span class="duration-chip">${durationText}</span>
+        <td>
+          <span class="log-duration-tag font-mono">${durationText}</span>
         </td>
       </tr>
     `;
@@ -385,7 +398,22 @@ function initEvents() {
 // 启动逻辑
 (async function bootstrap() {
   initEvents();
+
+  // 读取 URL 参数预设筛选条件
+  const urlParams = new URLSearchParams(window.location.search);
+  if (urlParams.has('port')) {
+    state.port = urlParams.get('port');
+  }
+  if (urlParams.has('keyword')) {
+    state.keyword = urlParams.get('keyword');
+    if (el.searchInput) el.searchInput.value = state.keyword;
+  }
+
   await loadNodes();
+  if (state.port && el.nodeSelect) {
+    el.nodeSelect.value = state.port;
+  }
+
   await fetchLogs();
   resetPolling();
 })();
