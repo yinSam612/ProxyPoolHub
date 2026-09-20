@@ -214,6 +214,17 @@ function latencyClass(ms) {
   return 'latency-high';
 }
 
+function renderTrafficMiniTag(traffic) {
+  if (!traffic) return '';
+  const up = traffic.todayUploadFormatted || '0 B';
+  const down = traffic.todayDownloadFormatted || '0 B';
+  return `
+    <div class="node-traffic-cell" title="今日流量: 上行 ${up} / 下行 ${down} | 累计下行: ${traffic.totalDownloadFormatted || '0 B'}">
+      <span class="traffic-mini-text"><span class="up">↑</span>${up} <span class="down">↓</span>${down}</span>
+    </div>
+  `;
+}
+
 /**
  * 构造生成单行 HTML，采用大面积点击热区的 checkbox
  * @param {object} item - 节点数据对象
@@ -265,6 +276,7 @@ function renderRowHtml(item, isChecked) {
       </td>
       <td class="col-port">
         <span class="port-chip font-mono">${item.listenPort}</span>
+        ${renderTrafficMiniTag(item.traffic)}
       </td>
       <td class="col-status">
         <span class="status-chip ${item.status}" title="${statusTitle}">
@@ -998,6 +1010,102 @@ document.querySelector('#btnRebindTotp').addEventListener('click', async () => {
     qrContainer.innerHTML = data.qrSvg || '';
   }
 });
+
+// ==========================================
+// 连接审计日志弹窗交互 (Logs Modal)
+// ==========================================
+const logsDialog = document.querySelector('#logsDialog');
+const openLogsBtn = document.querySelector('#openLogsBtn');
+const refreshLogsBtn = document.querySelector('#refreshLogsBtn');
+const logNodeFilter = document.querySelector('#logNodeFilter');
+const logKeywordFilter = document.querySelector('#logKeywordFilter');
+const logsTableBody = document.querySelector('#logsTableBody');
+let logsAutoTimer = null;
+
+async function fetchAndRenderLogs() {
+  if (!logsDialog || !logsDialog.open) return;
+  const port = logNodeFilter ? logNodeFilter.value : '';
+  const keyword = logKeywordFilter ? logKeywordFilter.value.trim() : '';
+  const params = new URLSearchParams();
+  if (port) params.set('port', port);
+  if (keyword) params.set('keyword', keyword);
+  params.set('limit', '100');
+
+  try {
+    const res = await api(`/api/logs?${params.toString()}`);
+    const list = res.logs || [];
+    if (!list.length) {
+      logsTableBody.innerHTML = '<tr><td colspan="6" class="logs-empty">暂无匹配的连接审计记录</td></tr>';
+      return;
+    }
+    logsTableBody.innerHTML = list.map((log) => {
+      const timeStr = log.timestamp ? new Date(log.timestamp).toLocaleTimeString('zh-CN', { hour12: false }) : '-';
+      const duration = log.durationMs ? `${log.durationMs}ms` : '<1ms';
+      return `
+        <tr>
+          <td class="col-log-time">${timeStr}</td>
+          <td class="col-log-port"><span class="port-chip font-mono">${log.listenPort || '-'}</span></td>
+          <td class="col-log-client log-client">${escapeHtml(log.client || '-')}</td>
+          <td class="col-log-target log-target" title="${escapeHtml(log.target)}">${escapeHtml(log.target || '-')}</td>
+          <td class="col-log-traffic">
+            <span class="traffic-tag">
+              <span class="up">↑ ${log.uploadFormatted || '0 B'}</span>
+              <span class="down">↓ ${log.downloadFormatted || '0 B'}</span>
+            </span>
+          </td>
+          <td class="col-log-duration">${duration}</td>
+        </tr>
+      `;
+    }).join('');
+  } catch (err) {
+    logsTableBody.innerHTML = `<tr><td colspan="6" class="logs-empty" style="color:#ef4444">加载失败: ${escapeHtml(err.message)}</td></tr>`;
+  }
+}
+
+function updateLogNodeSelectOptions() {
+  if (!logNodeFilter) return;
+  const currentVal = logNodeFilter.value;
+  const options = ['<option value="">全部节点</option>'];
+  for (const item of items) {
+    const label = `${item.listenPort} - ${item.name || item.server}`;
+    options.push(`<option value="${item.listenPort}"${currentVal === String(item.listenPort) ? ' selected' : ''}>${escapeHtml(label)}</option>`);
+  }
+  logNodeFilter.innerHTML = options.join('');
+}
+
+if (openLogsBtn && logsDialog) {
+  openLogsBtn.addEventListener('click', () => {
+    updateLogNodeSelectOptions();
+    logsDialog.showModal();
+    fetchAndRenderLogs();
+    if (!logsAutoTimer) {
+      logsAutoTimer = setInterval(fetchAndRenderLogs, 3000);
+    }
+  });
+
+  logsDialog.addEventListener('close', () => {
+    if (logsAutoTimer) {
+      clearInterval(logsAutoTimer);
+      logsAutoTimer = null;
+    }
+  });
+}
+
+if (refreshLogsBtn) {
+  refreshLogsBtn.addEventListener('click', fetchAndRenderLogs);
+}
+
+if (logNodeFilter) {
+  logNodeFilter.addEventListener('change', fetchAndRenderLogs);
+}
+
+if (logKeywordFilter) {
+  let searchDebounce = null;
+  logKeywordFilter.addEventListener('input', () => {
+    clearTimeout(searchDebounce);
+    searchDebounce = setTimeout(fetchAndRenderLogs, 250);
+  });
+}
 
 // 初始化刷新
 refresh().catch((error) => showMessage(error.message, true));

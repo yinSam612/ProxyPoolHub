@@ -6,7 +6,7 @@
   "scripts": {
     "start": "node server.js",
     "web": "node server.js",
-    "test": "node --check server.js && node --check src/core/proxy-manager.js && node tests/test_subscription.js && node tests/test_totp.js && node tests/test_e2e.js"
+    "test": "node --check server.js && node --check src/core/proxy-manager.js && node tests/test_log_manager.js && node tests/test_subscription.js && node tests/test_totp.js && node tests/test_e2e.js"
   },
   "keywords": [
     "proxy-pool",

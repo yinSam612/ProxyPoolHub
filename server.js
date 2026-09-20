@@ -297,6 +297,7 @@ async function parseForm(request) {
 
 function publicProxy(item) {
     const parsed = manager.parseProxyLink(item.link, 0);
+    const traffic = manager.logManager ? (manager.logManager.getTrafficSummary()[item.listenPort] || null) : null;
     return {
         id: item.id,
         name: item.name || parsed?.displayName || item.id,
@@ -311,7 +312,8 @@ function publicProxy(item) {
         exitIp: item.exitIp || '',
         location: item.location || '',
         lastCheckedAt: item.lastCheckedAt || '',
-        lastError: item.lastError || ''
+        lastError: item.lastError || '',
+        traffic
     };
 }
 
@@ -702,6 +704,17 @@ function triggerAsyncNodeCheck(targetItems) {
 }
 
 async function handleApi(request, response, url) {
+    if (request.method === 'GET' && url.pathname === '/api/logs') {
+        const port = Number(url.searchParams.get('port') || 0);
+        const keyword = String(url.searchParams.get('keyword') || '').trim();
+        const limit = Number(url.searchParams.get('limit') || 100);
+        const logs = manager.logManager ? manager.logManager.getRecentLogs({ port, keyword, limit }) : [];
+        return sendJson(response, 200, { ok: true, logs });
+    }
+    if (request.method === 'GET' && url.pathname === '/api/traffic') {
+        const traffic = manager.logManager ? manager.logManager.getTrafficSummary() : {};
+        return sendJson(response, 200, { ok: true, traffic });
+    }
     if (request.method === 'GET' && url.pathname === '/api/settings') {
         return sendJson(response, 200, publicSettings(request));
     }
@@ -1102,6 +1115,9 @@ function shutdown() {
     if (shuttingDown) return;
     shuttingDown = true;
     clearTimeout(restartTimer);
+    if (manager.logManager) {
+        manager.logManager.destroy();
+    }
     manager.stop({ silent: true });
     server.close(() => process.exit(0));
 }
