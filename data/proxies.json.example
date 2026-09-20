@@ -1,0 +1,32 @@
+{
+  "updatedAt": "2026-01-01T00:00:00.000Z",
+  "subscriptionUrl": "",
+  "proxies": [
+    {
+      "id": "sample-vless-node",
+      "name": "示例-VLESS节点",
+      "link": "vless://example-uuid@127.0.0.1:443?encryption=none&security=reality&sni=example.com&fp=chrome&pbk=example-public-key&sid=12345678&type=tcp#示例-VLESS节点",
+      "enabled": true,
+      "listenPort": 40000,
+      "status": "online",
+      "latencyMs": 50,
+      "exitIp": "1.2.3.4",
+      "location": "United States / California / Los Angeles",
+      "lastCheckedAt": "2026-01-01T00:00:00.000Z",
+      "lastError": ""
+    },
+    {
+      "id": "sample-hysteria2-node",
+      "name": "示例-Hysteria2节点",
+      "link": "hysteria2://password@127.0.0.1:20443?sni=bing.com&insecure=1#示例-Hysteria2节点",
+      "enabled": false,
+      "listenPort": 40001,
+      "status": "offline",
+      "latencyMs": 0,
+      "exitIp": "",
+      "location": "",
+      "lastCheckedAt": "2026-01-01T00:00:00.000Z",
+      "lastError": ""
+    }
+  ]
+}

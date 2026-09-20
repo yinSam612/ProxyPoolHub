@@ -1,0 +1,259 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>安全登录 · ProxyPoolHub</title>
+  <link rel="stylesheet" href="/style.css">
+</head>
+<body class="login-page">
+  <div class="login-bg-effects">
+    <div class="glow-orb orb-1"></div>
+    <div class="glow-orb orb-2"></div>
+  </div>
+
+  <main class="login-card">
+    <header class="login-header">
+      <div class="login-logo-wrap">
+        <svg viewBox="0 0 24 24" width="24" height="24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" class="brand-svg">
+          <polygon points="13 2 3 14 12 14 11 22 21 10 12 10 13 2"></polygon>
+        </svg>
+      </div>
+      <div>
+        <h1 class="login-title">ProxyPoolHub</h1>
+        <p class="login-subtitle">代理中继调度与混合代理池</p>
+      </div>
+    </header>
+
+    <!-- 登录模式切换 Tab -->
+    <div class="login-tabs" role="tablist">
+      <button id="tabTotp" class="tab-btn active" type="button" role="tab" aria-selected="true" onclick="switchLoginMode('totp')">
+        <svg class="tab-icon-svg" viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+          <path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"></path>
+        </svg>
+        <span>验证码登录</span>
+      </button>
+      <button id="tabPassword" class="tab-btn" type="button" role="tab" aria-selected="false" onclick="switchLoginMode('password')">
+        <svg class="tab-icon-svg" viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+          <rect x="3" y="11" width="18" height="11" rx="2" ry="2"></rect>
+          <path d="M7 11V7a5 5 0 0 1 10 0v4"></path>
+        </svg>
+        <span>密码登录</span>
+      </button>
+    </div>
+
+    <form id="loginForm" class="login-form" method="post" action="/login">
+      <!-- 统一管理账号 -->
+      <div class="form-group">
+        <label for="username">管理账号</label>
+        <div class="input-wrap">
+          <input id="username" name="username" value="{{DEFAULT_USER}}" required autocomplete="username" placeholder="管理员账号">
+        </div>
+      </div>
+
+      <!-- 模式 1: Google 身份验证器 6 位独立数字格子 (默认) -->
+      <div id="totpSection" class="form-group">
+        <div class="label-with-tip">
+          <label>Google 动态验证码</label>
+          <span class="badge-hint">无需复杂密码</span>
+        </div>
+        <!-- 6 位独立数字方格 -->
+        <div class="otp-container" id="otpBox">
+          <input type="text" class="otp-cell" maxlength="1" size="1" inputmode="numeric" pattern="[0-9]" autocomplete="off" autofocus>
+          <input type="text" class="otp-cell" maxlength="1" size="1" inputmode="numeric" pattern="[0-9]" autocomplete="off">
+          <input type="text" class="otp-cell" maxlength="1" size="1" inputmode="numeric" pattern="[0-9]" autocomplete="off">
+          <input type="text" class="otp-cell" maxlength="1" size="1" inputmode="numeric" pattern="[0-9]" autocomplete="off">
+          <input type="text" class="otp-cell" maxlength="1" size="1" inputmode="numeric" pattern="[0-9]" autocomplete="off">
+          <input type="text" class="otp-cell" maxlength="1" size="1" inputmode="numeric" pattern="[0-9]" autocomplete="off">
+        </div>
+      </div>
+
+      <!-- 模式 2: 管理员原始静态密码 -->
+      <div id="passwordSection" class="form-group" style="display: none;">
+        <label for="password">管理密码</label>
+        <div class="input-wrap password-wrap">
+          <input id="password" name="password" type="password" autocomplete="current-password" placeholder="请输入管理密码">
+          <button type="button" class="btn-toggle-pwd" onclick="togglePasswordVisibility('password', this)" tabindex="-1" title="切换密码可见性" aria-label="切换密码可见性">
+            <svg class="eye-svg eye-open" viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+              <path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"></path>
+              <circle cx="12" cy="12" r="3"></circle>
+            </svg>
+            <svg class="eye-svg eye-closed" viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="display: none;">
+              <path d="M17.94 17.94A10.07 10.07 0 0 1 12 20c-7 0-11-8-11-8a18.45 18.45 0 0 1 5.06-5.94M9.9 4.24A9.12 9.12 0 0 1 12 4c7 0 11 8 11 8a18.5 18.5 0 0 1-2.16 3.19m-6.72-1.07a3 3 0 1 1-4.24-4.24"></path>
+              <line x1="1" y1="1" x2="23" y2="23"></line>
+            </svg>
+          </button>
+        </div>
+      </div>
+
+      <!-- 隐藏域传递合成验证码（移出 Flex 容器，彻底杜绝多余间隙计算） -->
+      <input type="hidden" id="totpCode" name="totpCode" value="">
+
+      <!-- 记住免登与辅助项 -->
+      <div class="form-options">
+        <label class="checkbox-label">
+          <input type="checkbox" name="remember" value="true" checked>
+          <span>保持登录状态 (7天)</span>
+        </label>
+      </div>
+
+      <!-- 错误提示 -->
+      <div id="errorAlert" class="login-error" role="alert" style="{{ERROR_STYLE}}">{{ERROR}}</div>
+
+      <button id="submitBtn" class="button primary btn-login" type="submit">
+        <span>登 录</span>
+      </button>
+    </form>
+  </main>
+
+  <script>
+    const isTotpConfigured = "{{TOTP_CONFIGURED}}" === "true";
+    let currentMode = 'totp';
+    const otpCells = Array.from(document.querySelectorAll('.otp-cell'));
+    const hiddenTotp = document.getElementById('totpCode');
+
+    function showClientError(msg) {
+      const el = document.getElementById('errorAlert');
+      el.textContent = msg;
+      el.style.display = 'block';
+    }
+
+    function clearClientError() {
+      const el = document.getElementById('errorAlert');
+      el.textContent = '';
+      el.style.display = 'none';
+    }
+
+    function getOtpValue() {
+      return otpCells.map(c => c.value).join('');
+    }
+
+    function syncTotp() {
+      const val = getOtpValue();
+      hiddenTotp.value = val;
+      return val;
+    }
+
+    // OTP 6 格子智能交互（支持单个输入、退格回退、方向键导航、一键整体粘贴）
+    otpCells.forEach((cell, idx) => {
+      cell.addEventListener('input', (e) => {
+        clearClientError();
+        const val = cell.value.replace(/[^0-9]/g, '');
+        cell.value = val ? val.slice(-1) : '';
+        const code = syncTotp();
+
+        if (cell.value && idx < otpCells.length - 1) {
+          otpCells[idx + 1].focus();
+          otpCells[idx + 1].select();
+        }
+
+        // 输满 6 位自动提交登录
+        if (code.length === 6 && /^\d{6}$/.test(code)) {
+          document.getElementById('loginForm').requestSubmit();
+        }
+      });
+
+      cell.addEventListener('keydown', (e) => {
+        if (e.key === 'Backspace') {
+          if (!cell.value && idx > 0) {
+            otpCells[idx - 1].focus();
+            otpCells[idx - 1].value = '';
+            syncTotp();
+          }
+        } else if (e.key === 'ArrowLeft' && idx > 0) {
+          otpCells[idx - 1].focus();
+        } else if (e.key === 'ArrowRight' && idx < otpCells.length - 1) {
+          otpCells[idx + 1].focus();
+        }
+      });
+
+      cell.addEventListener('paste', (e) => {
+        e.preventDefault();
+        clearClientError();
+        const text = (e.clipboardData || window.clipboardData).getData('text').trim().replace(/[^0-9]/g, '');
+        if (!text) return;
+        const chars = text.slice(0, 6).split('');
+        chars.forEach((ch, i) => {
+          if (otpCells[i]) {
+            otpCells[i].value = ch;
+          }
+        });
+        const code = syncTotp();
+        const nextIdx = Math.min(chars.length, otpCells.length - 1);
+        otpCells[nextIdx].focus();
+        if (code.length === 6) {
+          document.getElementById('loginForm').requestSubmit();
+        }
+      });
+    });
+
+    function switchLoginMode(mode) {
+      currentMode = mode;
+      clearClientError();
+      const isTotp = mode === 'totp';
+      document.querySelector('#tabTotp').classList.toggle('active', isTotp);
+      document.querySelector('#tabPassword').classList.toggle('active', !isTotp);
+      document.querySelector('#totpSection').style.display = isTotp ? 'flex' : 'none';
+      document.querySelector('#passwordSection').style.display = isTotp ? 'none' : 'flex';
+
+      const passwordInput = document.querySelector('#password');
+
+      if (isTotp) {
+        passwordInput.value = '';
+        setTimeout(() => otpCells[0].focus(), 50);
+      } else {
+        otpCells.forEach(c => c.value = '');
+        syncTotp();
+        setTimeout(() => passwordInput.focus(), 50);
+      }
+    }
+
+    function togglePasswordVisibility(id, btn) {
+      const input = document.getElementById(id);
+      const isPwd = input.type === 'password';
+      input.type = isPwd ? 'text' : 'password';
+      btn.querySelector('.eye-open').style.display = isPwd ? 'none' : 'block';
+      btn.querySelector('.eye-closed').style.display = isPwd ? 'block' : 'none';
+    }
+
+    // 表单提交前校验（拦截浏览器默认原生英文气泡）
+    document.getElementById('loginForm').addEventListener('submit', function(e) {
+      const username = document.getElementById('username').value.trim();
+      if (!username) {
+        e.preventDefault();
+        showClientError('请输入管理账号');
+        document.getElementById('username').focus();
+        return;
+      }
+      if (currentMode === 'totp') {
+        const code = syncTotp();
+        if (!code || !/^\d{6}$/.test(code)) {
+          e.preventDefault();
+          showClientError('请输入手机 Google Authenticator 上的 6 位数字验证码');
+          const firstEmpty = otpCells.find(c => !c.value) || otpCells[0];
+          firstEmpty.focus();
+          return;
+        }
+      } else {
+        const pwd = document.getElementById('password').value;
+        if (!pwd) {
+          e.preventDefault();
+          showClientError('请输入管理密码');
+          document.getElementById('password').focus();
+          return;
+        }
+      }
+    });
+
+    document.getElementById('password').addEventListener('input', clearClientError);
+    document.getElementById('username').addEventListener('input', clearClientError);
+
+    // 初始化默认 Tab
+    if (!isTotpConfigured) {
+      switchLoginMode('password');
+    } else {
+      switchLoginMode('totp');
+    }
+  </script>
+</body>
+</html>

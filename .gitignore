@@ -1,0 +1,31 @@
+# 日志与运行时
+runtime/*
+!runtime/.gitkeep
+*.log
+
+# 依赖与缓存
+node_modules/
+.npm-cache/
+.DS_Store
+Thumbs.db
+
+# 敏感节点与个人隐私配置（开源防泄露）
+.env
+.env.local
+data/proxies.json
+proxies.txt
+
+# 临时数据与临时文件
+data/*.tmp
+*.tmp
+*.bak
+
+# .NET 构建产物与二进制可执行文件（通过 GitHub Releases 独立发布）
+bin/
+obj/
+*.user
+*.suo
+.vs/
+*.exe
+*.dll
+*.pdb

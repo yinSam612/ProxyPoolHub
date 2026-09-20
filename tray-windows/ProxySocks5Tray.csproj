@@ -1,0 +1,20 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>WinExe</OutputType>
+    <TargetFramework>net8.0-windows</TargetFramework>
+    <Nullable>enable</Nullable>
+    <UseWindowsForms>true</UseWindowsForms>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <ApplicationIcon>icon.ico</ApplicationIcon>
+    <StartupObject>ProxySocks5Tray.Program</StartupObject>
+    <PublishSingleFile>true</PublishSingleFile>
+    <SelfContained>false</SelfContained>
+    <IncludeNativeLibrariesForSelfExtract>true</IncludeNativeLibrariesForSelfExtract>
+    <EnableWindowsTargeting>true</EnableWindowsTargeting>
+    <AssemblyTitle>ProxyPoolHub 桌面托盘助手</AssemblyTitle>
+    <AssemblyDescription>ProxyPoolHub Windows 托盘管理与开机自启动助手</AssemblyDescription>
+    <Version>1.0.0</Version>
+  </PropertyGroup>
+
+</Project>
