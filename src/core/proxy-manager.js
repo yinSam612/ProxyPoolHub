@@ -6,6 +6,7 @@ const http = require('http');
 const net = require('net');
 const tls = require('tls');
 const { URL } = require('url');
+const LogManager = require('./log-manager');
 
 const MODULE_ROOT_DIR = path.resolve(__dirname, '..', '..');
 const DEFAULT_RUNTIME_DIR = path.join(MODULE_ROOT_DIR, 'runtime');
@@ -1052,6 +1053,12 @@ class ProxyManager {
         this.validPorts = [];
         this.lastResults = [];
         this.nodeInfoPromise = null;
+        this.logManager = options.logManager || new LogManager({
+            logDir: path.join(this.moduleConfig.moduleRoot, 'data', 'logs'),
+            trafficFile: path.join(this.moduleConfig.moduleRoot, 'data', 'traffic.json'),
+            retentionDays: Number(options.retentionDays || process.env.LOG_RETENTION_DAYS || 30),
+            maxTotalMb: Number(options.maxTotalMb || process.env.LOG_MAX_TOTAL_MB || 1024)
+        });
     }
 
     getState() {
@@ -1271,7 +1278,10 @@ class ProxyManager {
         outbounds.push({ type: 'direct', tag: 'direct' });
 
         return {
-            log: { level: 'error' },
+            log: {
+                level: 'info',
+                timestamp: true
+            },
             dns: {
                 servers: [
                     { tag: 'google', type: 'udp', server: '8.8.8.8', server_port: 53 },
@@ -1314,16 +1324,30 @@ class ProxyManager {
         }
 
         if (this.process.stdout) {
+            let stdoutBuf = '';
             this.process.stdout.on('data', (data) => {
-                process.stdout.write(String(data));
+                stdoutBuf += String(data);
+                const lines = stdoutBuf.split(/\r?\n/);
+                stdoutBuf = lines.pop();
+                for (const line of lines) {
+                    if (this.logManager) {
+                        this.logManager.feedKernelLogLine(line);
+                    }
+                }
             });
         }
 
         if (this.process.stderr) {
+            let stderrBuf = '';
             this.process.stderr.on('data', (data) => {
                 const text = String(data || '');
-                const lines = text.split(/\r?\n/).filter(Boolean);
+                stderrBuf += text;
+                const lines = stderrBuf.split(/\r?\n/);
+                stderrBuf = lines.pop();
                 for (const line of lines) {
+                    if (this.logManager) {
+                        this.logManager.feedKernelLogLine(line);
+                    }
                     if (shouldIgnoreSingBoxErrorLog(line)) {
                         continue;
                     }
