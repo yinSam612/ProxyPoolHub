@@ -37,7 +37,7 @@ generate_random_password() {
 
 # 函数: 检测并安装基础工具
 install_base_tools() {
-    echo -e "${YELLOW}[1/5] 检查系统基础工具...${NC}"
+    echo -e "${YELLOW}[1/6] 检查系统基础工具...${NC}"
     if command -v apt-get >/dev/null 2>&1; then
         apt-get update -y >/dev/null 2>&1 || true
         apt-get install -y curl tar git openssl >/dev/null 2>&1
@@ -50,7 +50,7 @@ install_base_tools() {
 
 # 函数: 检测并安装 Node.js LTS 运行环境 (要求 >= 18.0.0)
 check_nodejs() {
-    echo -e "${YELLOW}[2/5] 检查 Node.js 运行环境...${NC}"
+    echo -e "${YELLOW}[2/6] 检查 Node.js 运行环境...${NC}"
     local need_install=0
     if ! command -v node >/dev/null 2>&1; then
         need_install=1
@@ -79,7 +79,7 @@ check_nodejs() {
 
 # 函数: 初始化依赖与生成随机凭据
 install_dependencies() {
-    echo -e "${YELLOW}[3/5] 初始化项目配置与依赖...${NC}"
+    echo -e "${YELLOW}[3/6] 初始化项目配置与依赖...${NC}"
     local app_dir
     app_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
     cd "$app_dir"
@@ -104,8 +104,13 @@ install_dependencies() {
         sed -i "s/^ADMIN_PASSWORD=.*/ADMIN_PASSWORD=${rand_admin_pass}/" .env 2>/dev/null || echo "ADMIN_PASSWORD=${rand_admin_pass}" >> .env
         sed -i "s/^PROXY_PASSWORD=.*/PROXY_PASSWORD=${rand_proxy_pass}/" .env 2>/dev/null || echo "PROXY_PASSWORD=${rand_proxy_pass}" >> .env
         sed -i "s/^WEB_PORT=.*/WEB_PORT=3100/" .env 2>/dev/null || echo "WEB_PORT=3100" >> .env
+        sed -i "s/^WEB_HOST=.*/WEB_HOST=0.0.0.0/" .env 2>/dev/null || echo "WEB_HOST=0.0.0.0" >> .env
+        sed -i "s/^PROXY_LISTEN_ADDRESS=.*/PROXY_LISTEN_ADDRESS=0.0.0.0/" .env 2>/dev/null || echo "PROXY_LISTEN_ADDRESS=0.0.0.0" >> .env
         chmod 600 .env
         echo -e "${GREEN}✓ 已自动生成随机安全管理员密码并保存到 .env${NC}"
+    else
+        sed -i "s/^WEB_HOST=127.0.0.1/WEB_HOST=0.0.0.0/" .env 2>/dev/null || true
+        sed -i "s/^PROXY_LISTEN_ADDRESS=127.0.0.1/PROXY_LISTEN_ADDRESS=0.0.0.0/" .env 2>/dev/null || true
     fi
 
     # 初始化示例节点数据
@@ -120,7 +125,7 @@ install_dependencies() {
 
 # 函数: 检查平台对应 sing-box 二进制内核
 ensure_singbox_binary() {
-    echo -e "${YELLOW}[4/5] 检查 sing-box 内核...${NC}"
+    echo -e "${YELLOW}[4/6] 检查 sing-box 内核...${NC}"
     local app_dir
     app_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
     local target_bin="$app_dir/runtime/sing-box"
@@ -155,7 +160,7 @@ ensure_singbox_binary() {
 
 # 函数: 注册并启动 Systemd / PM2 系统常驻服务
 setup_system_service() {
-    echo -e "${YELLOW}[5/5] 配置系统服务守护...${NC}"
+    echo -e "${YELLOW}[5/6] 配置系统服务守护...${NC}"
     local app_dir
     app_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
     local node_path
@@ -198,6 +203,29 @@ EOF
     fi
 }
 
+# 函数: 检查并配置系统防火墙放行端口
+configure_firewall() {
+    echo -e "${YELLOW}[6/6] 检查系统防火墙端口放行...${NC}"
+    local app_dir
+    app_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+    local web_port
+    web_port=$(grep '^WEB_PORT=' "$app_dir/.env" 2>/dev/null | cut -d= -f2 || echo "3100")
+    local start_port
+    start_port=$(grep '^PROXY_START_PORT=' "$app_dir/.env" 2>/dev/null | cut -d= -f2 || echo "40000")
+    local end_port=$((start_port + 100))
+
+    if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -qw "active"; then
+        ufw allow "${web_port}/tcp" comment 'ProxyPoolHub Web Admin' >/dev/null 2>&1 || true
+        ufw allow "${start_port}:${end_port}/tcp" comment 'ProxyPoolHub Proxy Ports' >/dev/null 2>&1 || true
+        echo -e "${GREEN}✓ UFW 防火墙已放行: ${web_port}/tcp 与 ${start_port}:${end_port}/tcp${NC}"
+    elif command -v firewall-cmd >/dev/null 2>&1 && firewall-cmd --state >/dev/null 2>&1; then
+        firewall-cmd --permanent --add-port="${web_port}/tcp" >/dev/null 2>&1 || true
+        firewall-cmd --permanent --add-port="${start_port}-${end_port}/tcp" >/dev/null 2>&1 || true
+        firewall-cmd --reload >/dev/null 2>&1 || true
+        echo -e "${GREEN}✓ Firewalld 防火墙已放行: ${web_port}/tcp 与 ${start_port}-${end_port}/tcp${NC}"
+    fi
+}
+
 # 执行各阶段
 check_privileges
 install_base_tools
@@ -205,6 +233,7 @@ check_nodejs
 install_dependencies
 ensure_singbox_binary
 setup_system_service
+configure_firewall
 
 # 获取当前公网 IP 与配置凭据用于终端展示
 app_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
