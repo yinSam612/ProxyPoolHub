@@ -17,6 +17,8 @@ proxies.txt
 
 # 临时数据与临时文件
 data/*.tmp
+data/traffic.json
+data/logs/
 *.tmp
 *.bak
 

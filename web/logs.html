@@ -1,0 +1,178 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>连接审计与流量监控大盘 · ProxyPoolHub</title>
+  <link rel="stylesheet" href="/style.css">
+</head>
+<body class="logs-page-body">
+  <div class="shell logs-shell">
+    <!-- 顶部应用栏 -->
+    <header class="app-header logs-header">
+      <div class="brand">
+        <a href="/" class="button secondary btn-with-icon back-home-btn" title="返回节点管理主控制台">
+          <span class="btn-icon">←</span>
+          <span>返回控制台</span>
+        </a>
+        <div class="brand-divider"></div>
+        <div class="brand-badge-wrap">
+          <span class="brand-badge">📊</span>
+        </div>
+        <div>
+          <div class="brand-title-row">
+            <h1>连接审计与流量监控</h1>
+            <span class="brand-version pulse-badge" id="liveBadge">
+              <span class="status-dot online"></span> 实时监听
+            </span>
+          </div>
+          <p class="brand-desc">全节点连接日志审计 · 上下游 IP 与域名流向 · 30天流量统计</p>
+        </div>
+      </div>
+
+      <div class="header-actions">
+        <!-- 自动轮询速率设置 -->
+        <div class="polling-control">
+          <label for="autoRefreshSelect" class="control-label">实时刷新:</label>
+          <select id="autoRefreshSelect" class="form-select mini-select">
+            <option value="2000" selected>每 2 秒</option>
+            <option value="5000">每 5 秒</option>
+            <option value="10000">每 10 秒</option>
+            <option value="0">暂停轮询</option>
+          </select>
+        </div>
+
+        <!-- 手动刷新与导出 -->
+        <button id="refreshBtn" class="button secondary btn-with-icon" type="button" title="立即获取最新连接记录">
+          <span class="btn-icon">🔄</span>
+          <span>刷新</span>
+        </button>
+        <button id="exportCsvBtn" class="button secondary btn-with-icon" type="button" title="将当前筛选日志导出为 CSV 文件">
+          <span class="btn-icon">📥</span>
+          <span>导出 CSV</span>
+        </button>
+      </div>
+    </header>
+
+    <main class="logs-main">
+      <!-- 顶部统计卡片大盘 -->
+      <section class="overview-grid logs-metrics-grid" aria-label="流量与日志监控概览">
+        <div class="metric-card">
+          <div class="metric-meta">
+            <span class="metric-icon">🌐</span>
+            <span class="metric-title">今日总连接数</span>
+          </div>
+          <div class="metric-value" id="metricTotalConns">-</div>
+          <div class="metric-sub">各节点累计请求次数</div>
+        </div>
+
+        <div class="metric-card">
+          <div class="metric-meta">
+            <span class="metric-icon">📥</span>
+            <span class="metric-title">今日下行流量 (Download)</span>
+          </div>
+          <div class="metric-value text-accent" id="metricTodayDown">-</div>
+          <div class="metric-sub">下发至客户端数据总量</div>
+        </div>
+
+        <div class="metric-card">
+          <div class="metric-meta">
+            <span class="metric-icon">📤</span>
+            <span class="metric-title">今日上行流量 (Upload)</span>
+          </div>
+          <div class="metric-value text-success" id="metricTodayUp">-</div>
+          <div class="metric-sub">上行转发至目标站点总量</div>
+        </div>
+
+        <div class="metric-card">
+          <div class="metric-meta">
+            <span class="metric-icon">💾</span>
+            <span class="metric-title">审计存储与配额</span>
+          </div>
+          <div class="metric-value" id="metricStorageUsed">-</div>
+          <div class="storage-bar-wrap">
+            <div class="storage-bar-fill" id="storageBarFill" style="width: 0%;"></div>
+          </div>
+          <div class="metric-sub" id="metricStorageMeta">最长保留 30 天 / 配额 1024 MB</div>
+        </div>
+      </section>
+
+      <!-- 日志控制与多维筛选条 -->
+      <section class="panel logs-panel">
+        <div class="logs-toolbar">
+          <div class="toolbar-left">
+            <div class="filter-group">
+              <label for="nodeSelect" class="filter-label">节点筛选:</label>
+              <select id="nodeSelect" class="form-select filter-select">
+                <option value="">全部节点</option>
+              </select>
+            </div>
+
+            <div class="filter-group search-group">
+              <label for="searchInput" class="filter-label">过滤目标/IP:</label>
+              <div class="search-input-wrap">
+                <input id="searchInput" type="search" class="form-input search-input" placeholder="输入域名、目标端口或客户端 IP 回车检索...">
+                <button id="clearSearchBtn" class="clear-search-btn" type="button" title="清空搜索" style="display:none;">✕</button>
+              </div>
+            </div>
+          </div>
+
+          <div class="toolbar-right">
+            <div class="filter-group">
+              <label for="limitSelect" class="filter-label">展现条数:</label>
+              <select id="limitSelect" class="form-select mini-select">
+                <option value="50">50 条</option>
+                <option value="100" selected>100 条</option>
+                <option value="200">200 条</option>
+                <option value="500">500 条</option>
+              </select>
+            </div>
+            <div class="record-counter" id="recordCounter">
+              共 <span id="matchedCount" class="count-num">0</span> 条记录
+            </div>
+          </div>
+        </div>
+
+        <!-- 全宽流式连接审计数据表格 -->
+        <div class="table-card logs-table-card">
+          <div class="table-wrap logs-table-wrap">
+            <table class="data-table logs-table">
+              <thead>
+                <tr>
+                  <th class="th-time" style="width: 140px;">记录时间</th>
+                  <th class="th-node" style="width: 120px;">入口节点</th>
+                  <th class="th-client" style="width: 160px;">客户端来源 (IP:Port)</th>
+                  <th class="th-target">访问目标 (域名 / 站点)</th>
+                  <th class="th-traffic" style="width: 180px;">传输数据量 (上行 / 下行)</th>
+                  <th class="th-duration" style="width: 100px;">连接耗时</th>
+                </tr>
+              </thead>
+              <tbody id="logsTableBody">
+                <tr>
+                  <td colspan="6" class="logs-loading">
+                    <div class="loading-spinner"></div>
+                    <span>正在同步连接审计数据...</span>
+                  </td>
+                </tr>
+              </tbody>
+            </table>
+          </div>
+        </div>
+      </section>
+    </main>
+
+    <!-- 底部状态说明栏 -->
+    <footer class="logs-footer">
+      <div class="footer-tips">
+        <span>🛡️ 日志采用本地结构化审计记录，自动按日切片轮转</span>
+        <span>·</span>
+        <span>最长存储保留 30 天，内置 1GB 磁盘软配额防爆盘策略</span>
+        <span>·</span>
+        <span>数据仅保留于您专属的 VPS 宿主机中</span>
+      </div>
+    </footer>
+  </div>
+
+  <script src="/logs.js"></script>
+</body>
+</html>

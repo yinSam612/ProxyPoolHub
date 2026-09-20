@@ -709,7 +709,9 @@ async function handleApi(request, response, url) {
         const keyword = String(url.searchParams.get('keyword') || '').trim();
         const limit = Number(url.searchParams.get('limit') || 100);
         const logs = manager.logManager ? manager.logManager.getRecentLogs({ port, keyword, limit }) : [];
-        return sendJson(response, 200, { ok: true, logs });
+        const traffic = manager.logManager ? manager.logManager.getTrafficSummary() : {};
+        const storage = manager.logManager ? manager.logManager.getStorageInfo() : { retentionDays: 30, maxTotalMb: 1024, usedBytes: 0, usedFormatted: '0 B', fileCount: 0 };
+        return sendJson(response, 200, { ok: true, logs, traffic, storage });
     }
     if (request.method === 'GET' && url.pathname === '/api/traffic') {
         const traffic = manager.logManager ? manager.logManager.getTrafficSummary() : {};
@@ -948,7 +950,15 @@ async function handleApi(request, response, url) {
 }
 
 function serveStatic(request, response, url) {
-    const files = { '/': 'index.html', '/app.js': 'app.js', '/style.css': 'style.css' };
+    const files = {
+        '/': 'index.html',
+        '/index.html': 'index.html',
+        '/logs': 'logs.html',
+        '/logs.html': 'logs.html',
+        '/logs.js': 'logs.js',
+        '/app.js': 'app.js',
+        '/style.css': 'style.css'
+    };
     const name = files[url.pathname];
     if (!name) {
         return sendError(response, 404, 'not found');
