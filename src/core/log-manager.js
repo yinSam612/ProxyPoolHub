@@ -424,6 +424,34 @@ class LogManager {
     }
 
     /**
+     * 查询当前日志文件占用的磁盘空间与配额信息
+     * @returns {{ retentionDays: number, maxTotalMb: number, usedBytes: number, usedFormatted: string, fileCount: number }}
+     */
+    getStorageInfo() {
+        let usedBytes = 0;
+        let fileCount = 0;
+        try {
+            if (fs.existsSync(this.logDir)) {
+                const files = fs.readdirSync(this.logDir).filter((name) => name.endsWith('.log'));
+                fileCount = files.length;
+                for (const name of files) {
+                    try {
+                        const stat = fs.statSync(path.join(this.logDir, name));
+                        usedBytes += stat.size;
+                    } catch (e) {}
+                }
+            }
+        } catch (e) {}
+        return {
+            retentionDays: this.retentionDays,
+            maxTotalMb: this.maxTotalMb,
+            usedBytes,
+            usedFormatted: formatBytes(usedBytes),
+            fileCount
+        };
+    }
+
+    /**
      * 释放资源与定时器
      */
     destroy() {

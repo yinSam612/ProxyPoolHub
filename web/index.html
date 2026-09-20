@@ -33,11 +33,10 @@
           </form>
         </div>
 
-        <!-- 功能按钮组 -->
-        <button id="openLogsBtn" class="button secondary btn-with-icon" type="button" title="查看节点连接日志与流量审计">
+        <a id="openLogsBtn" href="/logs" class="button secondary btn-with-icon" title="前往连接日志与流量审计独立大盘">
           <span class="btn-icon">📋</span>
-          <span>访问日志</span>
-        </button>
+          <span>连接日志</span>
+        </a>
         <button id="openTotpDialog" class="button secondary btn-with-icon" type="button" title="绑定或管理 Google 身份验证器">
           <span class="btn-icon">🛡️</span>
           <span>身份验证器</span>
@@ -400,47 +399,6 @@
       <div class="modal-actions confirm-actions">
         <button id="confirmCancelBtn" class="button secondary" type="button">取消</button>
         <button id="confirmOkBtn" class="button danger" type="button">确定</button>
-      </div>
-    </div>
-  </dialog>
-
-  <!-- 节点连接与流量审计日志弹窗 -->
-  <dialog id="logsDialog" class="modal logs-modal">
-    <div class="modal-card logs-card">
-      <div class="logs-header">
-        <div class="logs-title-group">
-          <span class="logs-title-icon">📋</span>
-          <div>
-            <h3 class="logs-title">节点连接审计日志</h3>
-            <p class="logs-subtitle">实时审计节点接入请求、下游站点域名与数据传输流量（历史日志保留 30 天）</p>
-          </div>
-        </div>
-        <div class="logs-controls">
-          <select id="logNodeFilter" class="logs-select" aria-label="按节点筛选">
-            <option value="">全部节点</option>
-          </select>
-          <input id="logKeywordFilter" class="logs-search" placeholder="搜索目标域名 / 客户端 IP...">
-          <button id="refreshLogsBtn" class="button secondary btn-sm" type="button" title="立即刷新日志">刷新</button>
-          <button class="button secondary btn-sm" type="button" data-close="logsDialog">关闭</button>
-        </div>
-      </div>
-
-      <div class="logs-table-wrap">
-        <table class="logs-table">
-          <thead>
-            <tr>
-              <th class="col-log-time">时间</th>
-              <th class="col-log-port">节点端口</th>
-              <th class="col-log-client">上游客户端</th>
-              <th class="col-log-target">目标站点 (域名 / IP)</th>
-              <th class="col-log-traffic">数据流量 (上行 / 下行)</th>
-              <th class="col-log-duration">持续时长</th>
-            </tr>
-          </thead>
-          <tbody id="logsTableBody">
-            <tr><td colspan="6" class="logs-empty">暂无连接审计流水记录</td></tr>
-          </tbody>
-        </table>
       </div>
     </div>
   </dialog>
