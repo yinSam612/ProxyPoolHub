@@ -13,8 +13,8 @@ const DEFAULT_RUNTIME_DIR = path.join(MODULE_ROOT_DIR, 'runtime');
 const DEFAULT_STATE_FILE_PATH = path.join(DEFAULT_RUNTIME_DIR, 'proxy-state.json');
 const DEFAULT_LOCK_FILE_PATH = path.join(DEFAULT_RUNTIME_DIR, 'proxy-state.lock');
 const DEFAULT_TEST_URL = 'https://www.gstatic.com/generate_204';
-const DEFAULT_INFO_URL = 'https://ipapi.co/json/';
-const FALLBACK_INFO_URLS = ['https://api64.ipify.org', 'https://ifconfig.me/ip'];
+const DEFAULT_INFO_URL = 'http://ip-api.com/json/?fields=status,country,regionName,city,query';
+const FALLBACK_INFO_URLS = ['https://ipwho.is/', 'https://api64.ipify.org', 'https://ifconfig.me/ip'];
 const DEFAULT_SING_BOX_VERSION = '1.13.3';
 const DEFAULT_SING_BOX_GITHUB_BASE_URL = 'https://github.com/SagerNet/sing-box/releases/download';
 const DEFAULT_MODULE_CONFIG_PATH = path.join(MODULE_ROOT_DIR, 'proxy-socks5.json');
@@ -809,72 +809,97 @@ async function fetchTextViaProxyPort(port, url, options = {}) {
     }
 }
 
-function lookupIpGeo(ip, timeoutMs) {
-    const targetIp = String(ip || '').trim();
-    if (!targetIp) {
-        return Promise.resolve({
-            ip: '',
-            country: '',
-            region: '',
-            city: ''
-        });
-    }
+/**
+ * 结构化解析第三方 GeoIP 接口返回的 JSON
+ * @param {object} payload - 响应 JSON 对象
+ * @returns {{ ip: string, country: string, region: string, city: string } | null}
+ */
+function parseGeoPayload(payload) {
+    if (!payload || typeof payload !== 'object') return null;
+    const ip = String(payload.query || payload.ip || '').trim();
+    if (!ip || !net.isIP(ip)) return null;
+    const country = String(payload.country || payload.country_name || '').trim();
+    const region = String(payload.regionName || payload.region || '').trim();
+    const city = String(payload.city || '').trim();
+    return { ip, country, region, city };
+}
 
-    const requestUrl = `http://ip-api.com/json/${encodeURIComponent(targetIp)}?fields=status,country,regionName,city,query`;
-    return new Promise((resolve) => {
-        const request = http.get(requestUrl, {
+/**
+ * 直接发起 HTTP/HTTPS GET 请求并解析 JSON 结果
+ * @param {string} url - 目标 URL
+ * @param {number} timeoutMs - 超时毫秒数
+ * @returns {Promise<object>}
+ */
+function fetchJsonDirect(url, timeoutMs = 8000) {
+    return new Promise((resolve, reject) => {
+        const client = url.startsWith('https:') ? https : http;
+        const req = client.get(url, {
             headers: {
-                'User-Agent': 'proxy-socks5',
-                'Accept': 'application/json,text/plain,*/*'
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+                'Accept': 'application/json'
             },
             timeout: timeoutMs
-        }, (response) => {
+        }, (res) => {
+            if (res.statusCode < 200 || res.statusCode >= 300) {
+                res.resume();
+                return reject(new Error(`HTTP ${res.statusCode}`));
+            }
             const chunks = [];
-            response.on('data', (chunk) => chunks.push(Buffer.from(chunk)));
-            response.on('end', () => {
+            res.on('data', (c) => chunks.push(Buffer.from(c)));
+            res.on('end', () => {
                 try {
-                    const payload = JSON.parse(Buffer.concat(chunks).toString('utf8') || '{}');
-                    resolve({
-                        ip: String(payload.query || targetIp).trim(),
-                        country: String(payload.country || '').trim(),
-                        region: String(payload.regionName || '').trim(),
-                        city: String(payload.city || '').trim()
-                    });
-                } catch (_error) {
-                    resolve({
-                        ip: targetIp,
-                        country: '',
-                        region: '',
-                        city: ''
-                    });
+                    const parsed = JSON.parse(Buffer.concat(chunks).toString('utf8'));
+                    resolve(parsed);
+                } catch (err) {
+                    reject(err);
                 }
             });
-            response.on('error', () => resolve({
-                ip: targetIp,
-                country: '',
-                region: '',
-                city: ''
-            }));
         });
-
-        request.on('error', () => resolve({
-            ip: targetIp,
-            country: '',
-            region: '',
-            city: ''
-        }));
-        request.setTimeout(timeoutMs, () => {
-            request.destroy();
-            resolve({
-                ip: targetIp,
-                country: '',
-                region: '',
-                city: ''
-            });
+        req.on('error', reject);
+        req.setTimeout(timeoutMs, () => {
+            req.destroy(new Error('timeout'));
         });
     });
 }
 
+/**
+ * 根据出口 IP 多源兜底查询归属地信息（优先 ipwho.is，其次 ip-api.com）
+ * @param {string} ip - 目标公网 IP
+ * @param {number} [timeoutMs=8000] - 超时毫秒数
+ * @returns {Promise<{ ip: string, country: string, region: string, city: string }>}
+ */
+async function lookupIpGeo(ip, timeoutMs = 8000) {
+    const targetIp = String(ip || '').trim();
+    if (!targetIp || !net.isIP(targetIp)) {
+        return { ip: targetIp, country: '', region: '', city: '' };
+    }
+
+    // 1. 优先源：https://ipwho.is/ (支持国内与海外直连，稳定快速)
+    try {
+        const res = await fetchJsonDirect(`https://ipwho.is/${encodeURIComponent(targetIp)}`, timeoutMs);
+        const geo = parseGeoPayload(res);
+        if (geo && (geo.country || geo.region || geo.city)) {
+            return geo;
+        }
+    } catch (e) {}
+
+    // 2. 备用源：http://ip-api.com/json/ (海外直连高效)
+    try {
+        const res = await fetchJsonDirect(`http://ip-api.com/json/${encodeURIComponent(targetIp)}?fields=status,country,regionName,city,query`, timeoutMs);
+        const geo = parseGeoPayload(res);
+        if (geo && (geo.country || geo.region || geo.city)) {
+            return geo;
+        }
+    } catch (e) {}
+
+    return { ip: targetIp, country: '', region: '', city: '' };
+}
+
+/**
+ * 从返回文本中提取有效 IPv4 / IPv6 地址
+ * @param {string} value - 响应原始文本
+ * @returns {string} 提取到的 IP 字符串
+ */
 function extractIpAddress(value) {
     const text = String(value || '').trim();
     if (!text) {
@@ -886,22 +911,45 @@ function extractIpAddress(value) {
             return parsed.ip.trim();
         }
     } catch (error) {
-        // Plain-text IP responses are expected.
+        // 允许非 JSON 纯文本格式
     }
     return (text.match(/[0-9a-f:.]+/gi) || [])
         .map((candidate) => candidate.replace(/^\[|\]$/g, ''))
         .find((candidate) => net.isIP(candidate)) || '';
 }
 
+/**
+ * 通过指定节点的代理端口获取该节点的公网出口 IP 以及地理位置
+ * 优先使用代理通道请求综合 Geo 接口，一步到位同时获取 IP 与国家/地区/城市
+ * @param {number} port - 节点本地监听端口
+ * @param {object} [options={}] - 配置选项
+ * @returns {Promise<{ ip: string, country: string, region: string, city: string, error?: string }>}
+ */
 async function fetchProxyNodeInfo(port, options = {}) {
     const config = resolveModuleConfig(options);
     const urls = Array.from(new Set([config.infoUrl, ...FALLBACK_INFO_URLS].filter(Boolean)));
     let lastError = '';
     for (const url of urls) {
         try {
-            const ip = extractIpAddress(await fetchTextViaProxyPort(port, url, options));
+            const rawText = await fetchTextViaProxyPort(port, url, options);
+            if (!rawText) continue;
+
+            // 1. 尝试直接作为综合 Geo JSON 解析
+            try {
+                const parsed = JSON.parse(rawText);
+                const geo = parseGeoPayload(parsed);
+                if (geo && geo.ip) {
+                    if (geo.country || geo.region || geo.city) {
+                        return geo;
+                    }
+                    return await lookupIpGeo(geo.ip, Number(config.timeoutSeconds || 8) * 1000);
+                }
+            } catch (e) {}
+
+            // 2. 作为纯文本 IP 解析
+            const ip = extractIpAddress(rawText);
             if (ip) {
-                return lookupIpGeo(ip, Number(config.timeoutSeconds || 15) * 1000);
+                return await lookupIpGeo(ip, Number(config.timeoutSeconds || 8) * 1000);
             }
         } catch (error) {
             lastError = String(error && error.message || 'node-info-failed');
@@ -2062,6 +2110,7 @@ module.exports.verifyProxyPort = verifyProxyPort;
 module.exports.resolveRuntimeProxy = resolveRuntimeProxy;
 module.exports.normalizeUseProxy = normalizeUseProxy;
 module.exports.extractIpAddress = extractIpAddress;
+module.exports.lookupIpGeo = lookupIpGeo;
 
 if (require.main === module) {
     const action = String(process.argv[2] || 'start').trim().toLowerCase();
