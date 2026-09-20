@@ -1,0 +1,7 @@
+{
+  "startPort": 40000,
+  "timeoutSeconds": 15,
+  "maxConsecutiveHealthCheckFailures": 3,
+  "testUrl": "https://www.gstatic.com/generate_204",
+  "infoUrl": "https://api.ipify.org"
+}

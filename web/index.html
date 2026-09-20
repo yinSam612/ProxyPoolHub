@@ -1,0 +1,387 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>ProxyPoolHub · 多协议代理池与中继中枢</title>
+  <link rel="stylesheet" href="/style.css">
+</head>
+<body>
+  <div class="shell">
+    <!-- 顶部应用栏 -->
+    <header class="app-header">
+      <div class="brand">
+        <div class="brand-badge-wrap">
+          <span class="brand-badge">⚡</span>
+        </div>
+        <div>
+          <div class="brand-title-row">
+            <h1>ProxyPoolHub</h1>
+            <span class="brand-version">v1.2</span>
+          </div>
+          <p class="brand-desc">Hysteria2 / VLESS / Trojan 本地混合代理池</p>
+        </div>
+      </div>
+
+      <div class="header-actions">
+        <!-- 核心状态与登出 -->
+        <div class="service-pill">
+          <span id="serviceDot" class="status-dot online"></span>
+          <span id="serviceText">核心检测中</span>
+          <form class="logout-form" method="post" action="/logout">
+            <button class="btn-logout" type="submit" title="退出管理后台">退出</button>
+          </form>
+        </div>
+
+        <!-- 功能按钮组 -->
+        <button id="openTotpDialog" class="button secondary btn-with-icon" type="button" title="绑定或管理 Google 身份验证器">
+          <span class="btn-icon">🛡️</span>
+          <span>身份验证器</span>
+          <span id="totpBadge" class="mini-badge">未配置</span>
+        </button>
+        <button id="openSettingsDialog" class="button secondary btn-with-icon" type="button">
+          <span class="btn-icon">⚙️</span>
+          <span>访问设置</span>
+        </button>
+        <button id="openImportDialog" class="button secondary btn-with-icon" type="button">
+          <span class="btn-icon">📥</span>
+          <span>批量导入</span>
+        </button>
+        <button id="openAddDialog" class="button primary btn-with-icon" type="button">
+          <span class="btn-icon">＋</span>
+          <span>添加节点</span>
+        </button>
+        <a id="githubRepoLink" href="https://github.com/yinSam612/ProxyPoolHub" target="_blank" rel="noopener noreferrer" class="button secondary btn-icon-only github-link" title="前往 GitHub 项目仓库主页">
+          <svg class="github-svg" viewBox="0 0 24 24" width="16" height="16" fill="currentColor" aria-hidden="true">
+            <path d="M12 0C5.37 0 0 5.37 0 12c0 5.31 3.435 9.795 8.205 11.385.6.105.825-.255.825-.57 0-.285-.015-1.23-.015-2.235-3.015.555-3.795-.735-4.035-1.41-.135-.345-.72-1.41-1.23-1.695-.42-.225-1.02-.78-.015-.795.945-.015 1.62.87 1.845 1.23 1.08 1.815 2.805 1.305 3.495.99.105-.78.42-1.305.765-1.605-2.67-.3-5.46-1.335-5.46-5.925 0-1.305.465-2.385 1.23-3.225-.12-.3-.54-1.53.12-3.18 0 0 1.005-.315 3.3 1.23.96-.27 1.98-.405 3-.405s2.04.135 3 .405c2.295-1.56 3.3-1.23 3.3-1.23.66 1.65.24 2.88.12 3.18.765.84 1.23 1.905 1.23 3.225 0 4.605-2.805 5.625-5.475 5.925.435.375.81 1.095.81 2.22 0 1.605-.015 2.895-.015 3.3 0 .315.225.69.825.57A12.02 12.02 0 0024 12c0-6.63-5.37-12-12-12z"/>
+          </svg>
+        </a>
+      </div>
+    </header>
+
+    <main>
+      <!-- 概览指标卡片组 -->
+      <section class="overview-grid" aria-label="服务概览">
+        <div class="metric-card">
+          <div class="metric-meta">
+            <span class="metric-label">全部节点</span>
+            <span class="metric-icon">🌐</span>
+          </div>
+          <strong id="total" class="metric-value">0</strong>
+          <span class="metric-footnote">已注册的代理上游</span>
+        </div>
+
+        <div class="metric-card">
+          <div class="metric-meta">
+            <span class="metric-label">已启用节点</span>
+            <span class="metric-icon">🚀</span>
+          </div>
+          <strong id="enabled" class="metric-value">0</strong>
+          <span class="metric-footnote">已暴露本地监听端口</span>
+        </div>
+
+        <div class="metric-card">
+          <div class="metric-meta">
+            <span class="metric-label">在线就绪</span>
+            <span class="metric-icon">✨</span>
+          </div>
+          <strong id="online" class="metric-value text-success">0</strong>
+          <span id="onlineRate" class="metric-footnote">连通率 0%</span>
+        </div>
+
+        <div class="metric-card endpoint-card">
+          <div class="metric-meta">
+            <span class="metric-label">当前对外入口</span>
+            <span class="metric-icon">🔗</span>
+          </div>
+          <strong id="endpoint" class="metric-value font-mono">加载中...</strong>
+          <span class="metric-footnote">SOCKS5 / HTTP 统一认证入口</span>
+        </div>
+      </section>
+
+      <!-- 节点工作台 -->
+      <section class="workspace">
+        <div class="workspace-bar">
+          <div class="workspace-title">
+            <h2>节点列表</h2>
+            <span id="selectionText" class="selection-pill">未选择</span>
+          </div>
+
+          <!-- 搜索框与快捷过滤 -->
+          <div class="search-filter-wrap">
+            <input id="nodeFilter" class="search-input" type="text" placeholder="🔍 快速搜索节点名称、IP、端口、协议..." autocomplete="off">
+          </div>
+
+          <!-- 批量与快捷工具栏 -->
+          <div class="toolbar">
+            <button id="copyHttp" class="button secondary btn-sm" type="button" title="复制选中节点的公网 HTTP 代理链接">复制 HTTP</button>
+            <button id="copySocks" class="button secondary btn-sm" type="button" title="复制选中节点的公网 SOCKS5 代理链接">复制 SOCKS5</button>
+            <span class="toolbar-divider" aria-hidden="true"></span>
+            <button id="copyInternalHttp" class="button secondary btn-sm" type="button" title="复制本机/局域网其他服务使用的 HTTP 地址">内网 HTTP</button>
+            <button id="copyInternalSocks" class="button secondary btn-sm" type="button" title="复制本机/局域网其他服务使用的 SOCKS5 地址">内网 SOCKS5</button>
+            <span id="batchDeleteDivider" class="toolbar-divider" aria-hidden="true" style="display: none;"></span>
+            <button id="batchDelete" class="button danger btn-sm" type="button" title="批量删除所有选中的节点" style="display: none;">
+              <span class="btn-icon">🗑️</span>
+              <span id="batchDeleteText">批量删除</span>
+            </button>
+            <span class="toolbar-divider" aria-hidden="true"></span>
+            <button id="testAll" class="button secondary btn-sm btn-accent" type="button" title="在后台异步重新探测所有节点的连通性">
+              <span id="testAllSpinner" class="btn-spinner" style="display: none;"></span>
+              <span id="testAllText">刷新状态</span>
+            </button>
+          </div>
+        </div>
+
+        <!-- 节点数据表格 -->
+        <div class="table-wrap">
+          <table class="nodes-table">
+            <thead>
+              <tr>
+                <th class="col-select">
+                  <label class="checkbox-hitbox" title="全选所有已启用节点">
+                    <input id="selectAll" type="checkbox" aria-label="全选已启用节点">
+                  </label>
+                </th>
+                <th class="col-node">节点 / 目标</th>
+                <th class="col-proto">协议</th>
+                <th class="col-exit">出口 IP / 归属</th>
+                <th class="col-latency">延迟</th>
+                <th class="col-port">本地端口</th>
+                <th class="col-status">状态</th>
+                <th class="col-actions">操作</th>
+              </tr>
+            </thead>
+            <tbody id="rows">
+              <tr><td colspan="8" class="empty-state">
+                <div class="empty-wrap">
+                  <span class="empty-icon">📭</span>
+                  <p>暂无代理节点，点击右上角“添加节点”或“批量导入”开始。</p>
+                </div>
+              </td></tr>
+            </tbody>
+          </table>
+        </div>
+      </section>
+    </main>
+  </div>
+
+  <!-- 弹窗 1: 添加节点 -->
+  <dialog id="addDialog" class="modal">
+    <div class="modal-box">
+      <div class="modal-header">
+        <div>
+          <span class="modal-kicker">NEW RELAY</span>
+          <h2>添加代理节点</h2>
+        </div>
+        <button class="icon-button" type="button" data-close="addDialog" aria-label="关闭">×</button>
+      </div>
+      <form id="addForm" class="modal-form">
+        <label>
+          <span>代理链接 <span class="required">*</span></span>
+          <textarea id="link" name="link" required rows="4" placeholder="支持 hysteria2://、vless:// 或 trojan://"></textarea>
+        </label>
+        <label>
+          <span>节点名称 <span class="optional">(可选，留空使用链接默认名称)</span></span>
+          <input id="name" name="name" placeholder="例如：AWS-美东-01">
+        </label>
+        <div class="modal-actions">
+          <button class="button secondary" type="button" data-close="addDialog">取消</button>
+          <button class="button primary" type="submit">立即添加</button>
+        </div>
+      </form>
+    </div>
+  </dialog>
+
+  <!-- 弹窗 2: 批量导入 -->
+  <dialog id="importDialog" class="modal">
+    <div class="modal-box">
+      <div class="modal-header">
+        <div>
+          <span class="modal-kicker">BULK IMPORT</span>
+          <h2>批量导入节点</h2>
+        </div>
+        <button class="icon-button" type="button" data-close="importDialog" aria-label="关闭">×</button>
+      </div>
+      <form id="importForm" class="modal-form">
+        <label>
+          <span>节点链接列表 <span class="required">*</span></span>
+          <textarea id="importLinks" name="links" required rows="9" placeholder="每行一个 hysteria2://、vless:// 或 trojan:// 链接"></textarea>
+        </label>
+        <p class="form-hint">自动分配从起始端口（如 40000）开始的可用端口，并自动过滤重复链接。</p>
+        <div class="modal-actions">
+          <button class="button secondary" type="button" data-close="importDialog">取消</button>
+          <button class="button primary" type="submit">开始批量导入</button>
+        </div>
+      </form>
+    </div>
+  </dialog>
+
+  <!-- 弹窗 3: 编辑节点 -->
+  <dialog id="editDialog" class="modal">
+    <div class="modal-box">
+      <div class="modal-header">
+        <div>
+          <span class="modal-kicker">EDIT RELAY</span>
+          <h2>编辑节点信息</h2>
+        </div>
+        <button class="icon-button" type="button" data-close="editDialog" aria-label="关闭">×</button>
+      </div>
+      <form id="editForm" class="modal-form">
+        <label>
+          <span>代理链接 <span class="required">*</span></span>
+          <textarea id="editLink" name="link" required rows="4"></textarea>
+        </label>
+        <div class="form-grid-2">
+          <label>
+            <span>显示名称</span>
+            <input id="editName" name="name" placeholder="自定义节点名称">
+          </label>
+          <label>
+            <span>映射本地端口</span>
+            <input id="editListenPort" name="listenPort" readonly class="input-readonly">
+          </label>
+        </div>
+        <div class="modal-actions">
+          <button class="button secondary" type="button" data-close="editDialog">取消</button>
+          <button class="button primary" type="submit">保存更改</button>
+        </div>
+      </form>
+    </div>
+  </dialog>
+
+  <!-- 弹窗 4: 访问与内网设置 -->
+  <dialog id="settingsDialog" class="modal">
+    <div class="modal-box">
+      <div class="modal-header">
+        <div>
+          <span class="modal-kicker">SETTINGS</span>
+          <h2>访问与订阅设置</h2>
+        </div>
+        <button class="icon-button" type="button" data-close="settingsDialog" aria-label="关闭">×</button>
+      </div>
+      <form id="settingsForm" class="modal-form">
+        <div class="form-grid-2">
+          <label>
+            <span>代理认证用户名 <span class="required">*</span></span>
+            <input id="proxyUsername" name="proxyUsername" required autocomplete="off">
+          </label>
+          <label>
+            <span>代理认证密码 <span class="required">*</span></span>
+            <div class="password-field">
+              <input id="proxyPassword" name="proxyPassword" required type="password" autocomplete="new-password">
+              <button id="togglePassword" type="button" class="btn-toggle-pwd">显示</button>
+            </div>
+          </label>
+        </div>
+        <label>
+          <span>对外公开地址 / 域名</span>
+          <input id="publicHost" name="publicHost" placeholder="例如：vps.example.com 或公网 IPv4，留空则使用当前访问地址">
+        </label>
+
+        <!-- 内网订阅管理 -->
+        <div class="settings-subcard">
+          <div class="subcard-header">
+            <div>
+              <strong>内网动态订阅</strong>
+              <p>供内网其他服务或爬虫动态获取当前所有可用端口</p>
+            </div>
+            <button id="rotateSubscription" class="button danger btn-sm" type="button">轮换 Token</button>
+          </div>
+          <div class="subscription-group">
+            <div class="input-action-row">
+              <span class="row-label">SOCKS5</span>
+              <input id="subscriptionSocks" readonly class="input-readonly">
+              <button class="button secondary btn-sm" type="button" data-copy-subscription="socks5">复制</button>
+            </div>
+            <div class="input-action-row">
+              <span class="row-label">HTTP</span>
+              <input id="subscriptionHttp" readonly class="input-readonly">
+              <button class="button secondary btn-sm" type="button" data-copy-subscription="http">复制</button>
+            </div>
+          </div>
+        </div>
+
+        <div class="modal-actions">
+          <button class="button secondary" type="button" data-close="settingsDialog">取消</button>
+          <button class="button primary" type="submit">保存并重载</button>
+        </div>
+      </form>
+    </div>
+  </dialog>
+
+  <!-- 弹窗 5: Google 身份验证器 (TOTP) 绑定与管理 -->
+  <dialog id="totpDialog" class="modal">
+    <div class="modal-box modal-box-totp">
+      <div class="modal-header">
+        <div>
+          <span class="modal-kicker">TWO-FACTOR AUTH</span>
+          <h2>Google 身份验证器</h2>
+        </div>
+        <button class="icon-button" type="button" data-close="totpDialog" aria-label="关闭">×</button>
+      </div>
+
+      <div class="totp-content">
+        <!-- 状态提示 -->
+        <div id="totpStatusBanner" class="status-banner">
+          <span class="banner-icon">🛡️</span>
+          <div>
+            <strong id="totpStatusText">正在检查验证器状态...</strong>
+            <p id="totpStatusDesc">绑定后可直接使用手机 6 位动态验证码快捷登录，无需死记静态长密码。</p>
+          </div>
+        </div>
+
+        <!-- 扫码绑定区域 -->
+        <div id="totpSetupArea" class="totp-setup-area">
+          <div class="qr-container">
+            <div id="totpQrContainer" class="qr-svg-wrap"></div>
+            <p class="qr-tip">手机打开 Google Authenticator / 微软 Authenticator 扫码</p>
+          </div>
+
+          <div class="secret-info">
+            <span class="secret-label">或手动在 App 中添加以下密钥：</span>
+            <div class="secret-copy-box">
+              <code id="totpSecretText" class="secret-code">--------</code>
+              <button id="copyTotpSecret" class="button secondary btn-sm" type="button">复制密钥</button>
+            </div>
+
+            <!-- 输入验证码以完成绑定 -->
+            <form id="totpBindForm" class="totp-verify-form">
+              <label for="totpVerifyInput">
+                <span>输入 App 上的 6 位验证码以激活绑定：</span>
+              </label>
+              <div class="verify-input-group">
+                <input id="totpVerifyInput" type="text" maxlength="6" inputmode="numeric" pattern="\d{6}" placeholder="000000" autocomplete="off" required>
+                <button id="btnVerifyBind" class="button primary" type="submit">验证并启用</button>
+              </div>
+            </form>
+          </div>
+        </div>
+
+        <!-- 已绑定时的停用与重置操作 -->
+        <div id="totpManageArea" class="totp-manage-area" style="display: none;">
+          <div class="totp-active-info">
+            <span class="check-icon">✓</span>
+            <div>
+              <strong>身份验证器已正常启用</strong>
+              <p>您现在可以在登录时直接选择“验证码登录”，输入 6 位动态码快速登录。</p>
+            </div>
+          </div>
+          <div class="totp-danger-actions">
+            <button id="btnRebindTotp" class="button secondary" type="button">重新扫码绑定</button>
+            <button id="btnDisableTotp" class="button danger" type="button">停用身份验证器</button>
+          </div>
+        </div>
+      </div>
+
+      <div class="modal-actions">
+        <button class="button secondary" type="button" data-close="totpDialog">关闭</button>
+      </div>
+    </div>
+  </dialog>
+
+  <!-- 全局 Toast 提示容器 -->
+  <div id="message" class="toast-card" role="status" aria-live="polite"></div>
+
+  <script src="/app.js"></script>
+</body>
+</html>

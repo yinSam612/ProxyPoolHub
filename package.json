@@ -1,0 +1,27 @@
+{
+  "name": "proxy-pool-hub",
+  "version": "1.0.0",
+  "description": "ProxyPoolHub · 多协议中继汇聚与本地 HTTP/SOCKS5 混合代理池调度管理平台",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "web": "node server.js",
+    "test": "node --check server.js && node --check src/core/proxy-manager.js && node tests/test_subscription.js && node tests/test_totp.js && node tests/test_e2e.js"
+  },
+  "keywords": [
+    "proxy-pool",
+    "proxy-relay",
+    "socks5",
+    "http-proxy",
+    "hysteria2",
+    "vless",
+    "trojan",
+    "sing-box"
+  ],
+  "author": "",
+  "license": "MIT",
+  "engines": {
+    "node": ">=14.0.0"
+  },
+  "dependencies": {}
+}
