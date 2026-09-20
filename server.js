@@ -20,12 +20,14 @@ const ROOT = __dirname;
 function ensureEnvFile(envFile, exampleFile) {
     if (!fs.existsSync(envFile) && fs.existsSync(exampleFile)) {
         try {
+            const randomAdminPass = crypto.randomBytes(8).toString('hex');
+            const randomProxyPass = crypto.randomBytes(8).toString('hex');
             let template = fs.readFileSync(exampleFile, 'utf8');
             template = template
-                .replace(/ADMIN_PASSWORD=change-this-admin-password/, 'ADMIN_PASSWORD=admin888')
-                .replace(/PROXY_PASSWORD=change-this-proxy-password/, 'PROXY_PASSWORD=123456');
+                .replace(/ADMIN_PASSWORD=change-this-admin-password/, `ADMIN_PASSWORD=${randomAdminPass}`)
+                .replace(/PROXY_PASSWORD=change-this-proxy-password/, `PROXY_PASSWORD=${randomProxyPass}`);
             fs.writeFileSync(envFile, template, 'utf8');
-            console.log('[proxy] 首次运行检测到未配置 .env，已自动为您生成默认配置文件 (.env)');
+            console.log('[proxy] 首次运行检测到未配置 .env，已自动生成包含随机强密码的配置文件 (.env)');
         } catch (error) {
             // 忽略创建失败，继续向下加载
         }
@@ -66,7 +68,7 @@ const LAST_PUBLISHED_PORT = Number.isInteger(configuredLastPort) && configuredLa
     ? configuredLastPort
     : BASE_PORT + 100;
 const ADMIN_USER = String(process.env.ADMIN_USER || 'admin');
-const ADMIN_PASSWORD = String(process.env.ADMIN_PASSWORD || 'admin888');
+const ADMIN_PASSWORD = String(process.env.ADMIN_PASSWORD || crypto.randomBytes(8).toString('hex'));
 const SESSION_COOKIE = 'proxy_admin_session';
 const SESSION_TTL_MS = 12 * 60 * 60 * 1000;
 const LOGIN_WINDOW_MS = 10 * 60 * 1000;
