@@ -379,6 +379,27 @@
     </div>
   </dialog>
 
+  <!-- 美化操作确认对话框 -->
+  <dialog id="confirmDialog" class="modal confirm-modal">
+    <div class="modal-card confirm-card">
+      <div class="confirm-header">
+        <div class="confirm-icon-wrap" id="confirmIconWrap">
+          <svg viewBox="0 0 24 24" width="24" height="24" fill="none" stroke="currentColor" stroke-width="2">
+            <path d="M12 9v4m0 4h.01M21 12a9 9 0 11-18 0 9 9 0 0118 0z" stroke-linecap="round" stroke-linejoin="round"/>
+          </svg>
+        </div>
+        <div class="confirm-content">
+          <h3 id="confirmTitle" class="confirm-title">确认操作</h3>
+          <p id="confirmMessage" class="confirm-desc">此操作不可撤销，确定继续吗？</p>
+        </div>
+      </div>
+      <div class="modal-actions confirm-actions">
+        <button id="confirmCancelBtn" class="button secondary" type="button">取消</button>
+        <button id="confirmOkBtn" class="button danger" type="button">确定</button>
+      </div>
+    </div>
+  </dialog>
+
   <!-- 全局 Toast 提示容器 -->
   <div id="message" class="toast-card" role="status" aria-live="polite"></div>
 
