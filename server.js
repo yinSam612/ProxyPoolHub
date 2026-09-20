@@ -75,7 +75,7 @@ const LOGIN_WINDOW_MS = 10 * 60 * 1000;
 const LOGIN_MAX_ATTEMPTS = 10;
 const RECOVERY_FAILURES = Math.max(1, Math.floor(Number(process.env.PROXY_RECOVERY_FAILURES) || 3));
 const RECOVERY_MAX_DELAY_MS = Math.max(30000, Number(process.env.PROXY_RECOVERY_MAX_DELAY_MS) || 300000);
-const INTERNAL_PROXY_HOST = 'proxy-socks5';
+const INTERNAL_PROXY_HOST = '127.0.0.1';
 const sessions = new Map();
 const loginAttempts = new Map();
 let store = loadStore();
@@ -126,7 +126,7 @@ function saveStore() {
 }
 
 function subscriptionToken() {
-    const token = String(store.settings?.subscriptionToken || '');
+    const token = String(store.settings?.subscriptionToken || '').trim();
     if (/^[a-f0-9]{64}$/.test(token)) return token;
     const generated = crypto.randomBytes(32).toString('hex');
     store.settings = { ...store.settings, subscriptionToken: generated };
@@ -134,12 +134,17 @@ function subscriptionToken() {
     return generated;
 }
 
-function subscriptionUrls() {
+function subscriptionUrls(request) {
     const token = subscriptionToken();
     const port = Number(process.env.WEB_PORT || 3100);
+    let host = String(store.settings?.publicHost || process.env.PUBLIC_HOST || '').trim();
+    if (!host || host === 'proxy.example.com') {
+        const headerHost = request ? String(request.headers['x-forwarded-host'] || request.headers.host || '').split(':')[0] : '';
+        host = headerHost || '127.0.0.1';
+    }
     return {
-        http: `http://${INTERNAL_PROXY_HOST}:${port}/subscription/http/${token}`,
-        socks5: `http://${INTERNAL_PROXY_HOST}:${port}/subscription/socks5/${token}`
+        http: `http://${host}:${port}/subscription/http/${token}`,
+        socks5: `http://${host}:${port}/subscription/socks5/${token}`
     };
 }
 
@@ -310,13 +315,17 @@ function publicProxy(item) {
     };
 }
 
-function publicSettings() {
+function publicSettings(request) {
+    let configuredHost = String(store.settings?.publicHost || process.env.PUBLIC_HOST || '').trim();
+    if (configuredHost === 'proxy.example.com') {
+        configuredHost = '';
+    }
     return {
         adminUser: ADMIN_USER || 'admin',
         proxyUsername: proxyUser,
         proxyPassword,
-        publicHost: String(store.settings?.publicHost || process.env.PUBLIC_HOST || ''),
-        subscriptions: subscriptionUrls(),
+        publicHost: configuredHost,
+        subscriptions: subscriptionUrls(request),
         totpEnabled: Boolean(store.settings?.totpEnabled),
         totpConfigured: Boolean(store.settings?.totpSecret),
         authDisabled: isAuthDisabled()
@@ -694,13 +703,13 @@ function triggerAsyncNodeCheck(targetItems) {
 
 async function handleApi(request, response, url) {
     if (request.method === 'GET' && url.pathname === '/api/settings') {
-        return sendJson(response, 200, publicSettings());
+        return sendJson(response, 200, publicSettings(request));
     }
     if (request.method === 'PUT' && url.pathname === '/api/settings') {
         const body = await parseBody(request);
         await exclusive(async () => {
             await updateSettings(body);
-            sendJson(response, 200, publicSettings());
+            sendJson(response, 200, publicSettings(request));
         });
         return;
     }
@@ -740,7 +749,7 @@ async function handleApi(request, response, url) {
         return exclusive(() => {
             store.settings = { ...store.settings, subscriptionToken: crypto.randomBytes(32).toString('hex') };
             saveStore();
-            sendJson(response, 200, publicSettings());
+            sendJson(response, 200, publicSettings(request));
         });
     }
     if (request.method === 'GET' && url.pathname === '/api/status') {

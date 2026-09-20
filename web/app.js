@@ -18,6 +18,7 @@ const importDialog = document.querySelector('#importDialog');
 const editDialog = document.querySelector('#editDialog');
 const settingsDialog = document.querySelector('#settingsDialog');
 const totpDialog = document.querySelector('#totpDialog');
+const confirmDialog = document.querySelector('#confirmDialog');
 
 const nodeFilter = document.querySelector('#nodeFilter');
 const selectAll = document.querySelector('#selectAll');
@@ -28,7 +29,77 @@ let items = [];
 let toastTimer = null;
 let currentTotpSetup = null;
 let autoPollerTimer = null;
-const INTERNAL_PROXY_HOST = 'proxy-socks5';
+const INTERNAL_PROXY_HOST = '127.0.0.1';
+
+/**
+ * 弹出高质感异步确认对话框，取代原生 confirm()
+ * @param {object} options
+ * @param {string} [options.title='确认操作'] - 弹窗标题
+ * @param {string} options.message - 描述内容
+ * @param {string} [options.confirmText='确定'] - 确定按钮文本
+ * @param {string} [options.cancelText='取消'] - 取消按钮文本
+ * @param {boolean} [options.danger=true] - 是否为危险操作
+ * @returns {Promise<boolean>}
+ */
+function showConfirm({ title = '确认操作', message, confirmText = '确定', cancelText = '取消', danger = true }) {
+  return new Promise((resolve) => {
+    if (!confirmDialog) {
+      return resolve(window.confirm(message));
+    }
+    const titleEl = document.querySelector('#confirmTitle');
+    const descEl = document.querySelector('#confirmMessage');
+    const okBtn = document.querySelector('#confirmOkBtn');
+    const cancelBtn = document.querySelector('#confirmCancelBtn');
+    const iconWrap = document.querySelector('#confirmIconWrap');
+
+    if (titleEl) titleEl.textContent = title;
+    if (descEl) descEl.textContent = message;
+    if (okBtn) {
+      okBtn.textContent = confirmText;
+      okBtn.className = danger ? 'button danger' : 'button primary';
+    }
+    if (cancelBtn) cancelBtn.textContent = cancelText;
+    if (iconWrap) {
+      iconWrap.className = danger ? 'confirm-icon-wrap' : 'confirm-icon-wrap warning';
+    }
+
+    let settled = false;
+    const cleanup = () => {
+      okBtn?.removeEventListener('click', onOk);
+      cancelBtn?.removeEventListener('click', onCancel);
+      confirmDialog.removeEventListener('close', onClose);
+    };
+
+    const onOk = () => {
+      if (settled) return;
+      settled = true;
+      cleanup();
+      confirmDialog.close();
+      resolve(true);
+    };
+
+    const onCancel = () => {
+      if (settled) return;
+      settled = true;
+      cleanup();
+      confirmDialog.close();
+      resolve(false);
+    };
+
+    const onClose = () => {
+      if (settled) return;
+      settled = true;
+      cleanup();
+      resolve(false);
+    };
+
+    okBtn?.addEventListener('click', onOk);
+    cancelBtn?.addEventListener('click', onCancel);
+    confirmDialog.addEventListener('close', onClose);
+
+    confirmDialog.showModal();
+  });
+}
 
 /**
  * HTML 转义工具函数，防御 XSS
@@ -320,16 +391,32 @@ function render(listItems) {
 }
 
 /**
+ * 获取当前节点复制时使用的有效域名或 IP
+ * 若设置为空或为默认占位符 proxy.example.com，则自适应读取当前浏览器访问地址
+ * @param {string} [hostOverride] - 手动指定的主机名
+ * @returns {string} 有效的主机地址
+ */
+function getEffectiveHost(hostOverride) {
+  if (hostOverride) return hostOverride;
+  const configured = String(settings.publicHost || '').trim();
+  if (configured && configured !== 'proxy.example.com') {
+    return configured;
+  }
+  return location.hostname || '127.0.0.1';
+}
+
+/**
  * 生成节点的公网或内网代理连接字符串
  * @param {object} item - 节点
  * @param {string} scheme - 协议 scheme
  * @param {string} [host] - 主机名
  * @returns {string} 代理字符串
  */
-function endpoint(item, scheme, host = settings.publicHost || location.hostname) {
+function endpoint(item, scheme, host) {
+  const effectiveHost = getEffectiveHost(host);
   const user = encodeURIComponent(settings.proxyUsername);
   const password = encodeURIComponent(settings.proxyPassword);
-  return `${scheme}://${user}:${password}@${host}:${item.listenPort}`;
+  return `${scheme}://${user}:${password}@${effectiveHost}:${item.listenPort}`;
 }
 
 /**
@@ -444,7 +531,13 @@ document.querySelectorAll('[data-copy-subscription]').forEach((button) => {
 
 // 轮换订阅密钥
 document.querySelector('#rotateSubscription').addEventListener('click', async (event) => {
-  if (!window.confirm('轮换 Token 后，旧订阅地址将立即失效。确定继续吗？')) return;
+  const confirmed = await showConfirm({
+    title: '轮换订阅 Token',
+    message: '轮换 Token 后，旧订阅地址将立即失效。确定继续吗？',
+    confirmText: '确认轮换',
+    danger: true
+  });
+  if (!confirmed) return;
   const button = event.currentTarget;
   button.disabled = true;
   try {
@@ -663,7 +756,13 @@ if (batchDeleteBtn) {
       showMessage('请先勾选需要删除的节点', true);
       return;
     }
-    if (!confirm(`确定要批量删除选中的 ${ids.length} 个节点吗？此操作无法撤销。`)) {
+    const confirmed = await showConfirm({
+      title: '批量删除节点',
+      message: `确定要批量删除选中的 ${ids.length} 个节点吗？此操作不可撤销。`,
+      confirmText: '确认批量删除',
+      danger: true
+    });
+    if (!confirmed) {
       return;
     }
     batchDeleteBtn.disabled = true;
@@ -719,7 +818,14 @@ rows.addEventListener('click', async (event) => {
 
   // 3. 删除
   if (action === 'remove') {
-    if (!window.confirm(`确定删除节点“${item.name || item.server}”？`)) return;
+    const nodeName = item.name || item.server || '指定节点';
+    const confirmed = await showConfirm({
+      title: '删除节点',
+      message: `确定删除节点“${nodeName}”？此操作不可逆。`,
+      confirmText: '确认删除',
+      danger: true
+    });
+    if (!confirmed) return;
   }
 
   // 4. 手动单节点测速
@@ -859,7 +965,13 @@ totpBindForm.addEventListener('submit', async (event) => {
 
 // 停用 TOTP
 document.querySelector('#btnDisableTotp').addEventListener('click', async () => {
-  if (!window.confirm('停用后将不能使用 6 位动态验证码登录，只能使用静态密码。确定停用？')) return;
+  const confirmed = await showConfirm({
+    title: '停用身份验证器',
+    message: '停用后将不能使用 6 位动态验证码登录，只能使用静态密码。确定停用？',
+    confirmText: '确定停用',
+    danger: true
+  });
+  if (!confirmed) return;
   try {
     await api('/api/totp/disable', { method: 'POST' });
     settings.totpEnabled = false;
