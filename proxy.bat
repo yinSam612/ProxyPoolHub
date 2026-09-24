@@ -6,13 +6,7 @@ goto :main
 
 :main
 set "ACTION=%~1"
-if "%ACTION%"=="" (
-    if exist "ProxySocks5Tray.exe" (
-        goto :tray
-    ) else (
-        goto :web
-    )
-)
+if "%ACTION%"=="" goto :tray
 
 if /I "%ACTION%"=="help" goto :usage
 if /I "%ACTION%"=="tray" goto :tray
@@ -81,16 +75,14 @@ if not exist "node_modules" (
 exit /b 0
 
 :tray
-call :ensure_dependencies || exit /b 1
-if exist "ProxySocks5Tray.exe" (
-  echo [提示] 正在启动 Proxy-SOCKS5 桌面托盘管理助手（后台静默模式）...
-  start "" "ProxySocks5Tray.exe"
-  echo [成功] 托盘程序已启动！请查看屏幕右下角通知区域。
-  exit /b 0
-) else (
-  echo [提示] 未找到预编译的 ProxySocks5Tray.exe，正在切换为 Web 控制台前台模式...
-  goto :web
-)
+if not exist "%~dp0ProxySocks5Tray.exe" goto :tray_missing
+start "" "%~dp0ProxySocks5Tray.exe"
+exit /b 0
+
+:tray_missing
+echo [ERROR] ProxySocks5Tray.exe not found beside proxy.bat.
+pause
+exit /b 1
 
 :web
 call :ensure_dependencies || exit /b 1
