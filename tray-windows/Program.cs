@@ -49,6 +49,7 @@ static class Program
 
         // 启动后台 Node 服务
         StartNodeServer();
+        _trayIcon?.ShowBalloonTip(3000, "ProxyPoolHub", "托盘已启动，请查看右下角通知区域。", ToolTipIcon.Info);
 
         // 运行消息循环
         Application.Run();
