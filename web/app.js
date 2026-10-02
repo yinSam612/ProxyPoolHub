@@ -25,6 +25,8 @@ const realityDialog = document.querySelector('#realityDialog');
 const passwordDialog = document.querySelector('#passwordDialog');
 const totpDialog = document.querySelector('#totpDialog');
 const confirmDialog = document.querySelector('#confirmDialog');
+const nodeSettingsDialog = document.querySelector('#nodeSettingsDialog');
+const copyScope = document.querySelector('#copyScope');
 
 const nodeFilter = document.querySelector('#nodeFilter');
 const selectAll = document.querySelector('#selectAll');
@@ -45,6 +47,31 @@ const DOCKER_PROXY_HOST = 'host';
 
 function icon(name) {
   return `<svg class="tool-icon" aria-hidden="true"><use href="/lucide.svg#${name}"></use></svg>`;
+}
+
+function requestReauth(title, message = '') {
+  const dialog = document.querySelector('#reauthDialog');
+  const form = document.querySelector('#reauthForm');
+  form.reset();
+  document.querySelector('#reauthTitle').textContent = title;
+  document.querySelector('#reauthMessage').textContent = message;
+  document.querySelector('#reauthTotp').hidden = !settings.totpEnabled;
+  form.elements.totpCode.required = Boolean(settings.totpEnabled);
+  return new Promise((resolve) => {
+    let credentials = null;
+    const submit = (event) => {
+      event.preventDefault();
+      credentials = { currentPassword: form.elements.currentPassword.value, totpCode: form.elements.totpCode.value };
+      dialog.close();
+    };
+    form.addEventListener('submit', submit);
+    dialog.addEventListener('close', () => {
+      form.removeEventListener('submit', submit);
+      form.reset();
+      resolve(credentials);
+    }, { once: true });
+    dialog.showModal();
+  });
 }
 
 /**
@@ -136,6 +163,18 @@ function escapeHtml(value) {
  */
 function showMessage(text, error = false, duration = 3500) {
   clearTimeout(toastTimer);
+  const dialog = document.activeElement?.closest('dialog[open]') || [...document.querySelectorAll('dialog[open]')].at(-1);
+  if (dialog) {
+    message.className = 'toast-card';
+    if (!dialog.querySelector('.dialog-feedback')) {
+      const feedback = document.createElement('p');
+      feedback.className = 'dialog-feedback';
+      feedback.setAttribute('role', 'status');
+      dialog.querySelector('.modal-header').after(feedback);
+    }
+    dialogFeedback(dialog, text, error);
+    return;
+  }
   message.textContent = text || '';
   message.className = `toast-card visible${error ? ' error' : ''}`;
   toastTimer = setTimeout(() => {
@@ -223,6 +262,7 @@ function updateSelectionText() {
     batchDeleteDivider.style.display = deletableCount > 0 ? 'inline-block' : 'none';
   }
   const visible = Array.from(rows.querySelectorAll('.row-select'));
+  visible.forEach((checkbox) => checkbox.closest('.node-row').classList.toggle('is-selected', selectedNodeIds.has(checkbox.dataset.id)));
   const checkedCount = visible.filter((checkbox) => selectedNodeIds.has(checkbox.dataset.id)).length;
   selectAll.checked = visible.length > 0 && checkedCount === visible.length;
   selectAll.indeterminate = checkedCount > 0 && checkedCount < visible.length;
@@ -231,6 +271,10 @@ function updateSelectionText() {
   mobileSelectAll.checked = selectAll.checked;
   mobileSelectAll.indeterminate = selectAll.indeterminate;
   mobileSelectAll.disabled = selectAll.disabled;
+  const enabledItems = getSelectedItems().filter((item) => item.enabled);
+  for (const [id, field] of [['copyHttp'], ['copySocks'], ['copyDockerHttp'], ['copyDockerSocks'], ['copyHy2', 'hy2'], ['copyVless', 'reality']]) {
+    document.querySelector(`#${id}`).disabled = !enabledItems.some((item) => !field || (item[field]?.status === 'enabled' && item[field].link));
+  }
 }
 
 /**
@@ -275,9 +319,12 @@ function renderRowHtml(item, isChecked) {
   const realityEnabled = realityConfigured && item.enabled && serviceStatus?.core !== 'stopped';
   const checkedTime = item.lastCheckedAt ? new Date(item.lastCheckedAt).toLocaleTimeString('zh-CN', { hour12: false }) : '未检测';
   const statusTitle = escapeHtml([item.lastError, item.lastCheckedAt && `检测时间 ${new Date(item.lastCheckedAt).toLocaleString('zh-CN')}`, '本机 SOCKS5 / TLS 探测，不代表外部 HY2/VLESS 可达'].filter(Boolean).join('\n'));
+  const target = currentCopyTarget();
+  const location = String(item.location || '').split(' / ').filter(Boolean);
+  const shortLocation = [...new Set([item.countryCode || location[0], location.length > 1 ? location.at(-1) : ''].filter(Boolean))].join(' · ') || '—';
 
   return `
-    <tr class="node-row ${item.enabled ? '' : 'disabled-row'}" id="row-${item.id}" data-id="${item.id}">
+    <tr class="node-row ${isChecked ? 'is-selected' : ''} ${item.enabled ? '' : 'disabled-row'}" id="row-${item.id}" data-id="${item.id}">
       <td class="col-select">
         <label class="checkbox-hitbox" title="选择节点 ${name}">
           <input class="row-select" type="checkbox" data-id="${item.id}" aria-label="选择 ${name}"${checked}>
@@ -286,7 +333,7 @@ function renderRowHtml(item, isChecked) {
       <td class="col-node">
         <div class="node-title-cell">
           <strong class="node-name" title="${name}">${name}</strong>
-          <span class="node-target font-mono">${item.isLocal ? '自身 VPS · 直连' : `${escapeHtml(item.server)}:${item.upstreamPort}`}</span>
+          <span class="node-target font-mono" title="${item.isLocal ? '自身 VPS · 不可删除' : `${escapeHtml(item.server)}:${item.upstreamPort}`}">${item.isLocal ? '自身 VPS · 直连' : `${escapeHtml(item.server)}:${item.upstreamPort}`}</span>
         </div>
       </td>
       <td class="col-proto">
@@ -295,15 +342,14 @@ function renderRowHtml(item, isChecked) {
       <td class="col-exit">
         <div class="exit-cell">
           <strong class="exit-ip font-mono">${escapeHtml(item.exitIp || '未检测')}</strong>
-          <span class="exit-location">${escapeHtml(item.location || '—')}</span>
+          <span class="exit-location" title="${escapeHtml(item.location || '')}">${escapeHtml(shortLocation)}</span>
         </div>
       </td>
       <td class="col-latency">
         <span class="latency-val ${latencyClass(item.latencyMs)}">${item.latencyMs ? `${item.latencyMs} ms` : '—'}</span>
       </td>
       <td class="col-port">
-        <span class="port-chip font-mono${coreDisabled ? ' port-inactive' : ''}" title="HTTP / SOCKS5 · 本机、Docker 或公网 · ${coreDisabled ? '未监听' : '已启用'}">TCP ${item.listenPort}</span>
-        <span class="port-chip hy2-port-chip font-mono${hy2Enabled ? '' : ' port-inactive'}" title="HY2 · 外部使用 · UDP · ${hy2Enabled ? '已启用，公网 UDP 尚未检测' : hy2Configured ? '已配置，但核心已停止' : '未启用'}">${hy2Configured ? `HY2 ${item.listenPort}${hy2Enabled ? '' : ' 停止'}` : 'HY2 未启用'}</span>
+        <span class="port-chip font-mono${hy2Configured ? ' hy2-port-chip' : ''}${coreDisabled ? ' port-inactive' : ''}" title="HTTP / SOCKS5 · TCP${hy2Configured ? '；HY2 · 公网 UDP' : ''} · ${coreDisabled ? '未监听' : '已启用'}">${hy2Configured ? 'TCP/UDP' : 'TCP'} ${item.listenPort}${hy2Configured && !hy2Enabled ? ' 停止' : ''}</span>
         ${item.reality ? `<span class="port-chip reality-port-chip font-mono${realityEnabled ? '' : ' port-inactive'}" title="VLESS + RAW + Reality · 外部使用 · TCP">VLESS ${item.reality.listenPort}${realityEnabled ? '' : ' 停止'}</span>` : ''}
         ${renderTrafficMiniTag(item.traffic)}
       </td>
@@ -317,26 +363,24 @@ function renderRowHtml(item, isChecked) {
       <td class="col-actions">
         <div class="actions-group">
           <div class="copy-actions" aria-label="复制代理地址">
-            <button class="btn-action" data-action="copy-http" data-id="${item.id}" title="复制本机 HTTP 地址：127.0.0.1"${disabled}>HTTP</button>
-            <button class="btn-action" data-action="copy-socks" data-id="${item.id}" title="复制本机 SOCKS5 地址：127.0.0.1"${disabled}>SOCKS5</button>
-            <button class="btn-action" data-action="${hy2Configured ? 'copy-hy2' : 'hy2'}" data-id="${item.id}" title="${hy2Configured ? '复制公网 HY2 连接' : '启用公网 HY2'}"${disabled}>${hy2Configured ? 'HY2' : 'HY2 +'}</button>
-            <button class="btn-action" data-action="${realityConfigured ? 'copy-reality' : 'reality'}" data-id="${item.id}" title="${realityConfigured ? '复制 VLESS + RAW + Reality 链接' : '配置 VLESS + RAW + Reality'}"${disabled}>${realityConfigured ? 'VLESS' : 'VLESS +'}</button>
+            <button class="btn-action" data-action="copy-http" data-id="${item.id}" title="复制${target.label} HTTP 地址"${disabled}>HTTP</button>
+            <button class="btn-action" data-action="copy-socks" data-id="${item.id}" title="复制${target.label} SOCKS5 地址"${disabled}>SOCKS5</button>
+            <button class="btn-action" data-action="copy-hy2" data-id="${item.id}" title="${hy2Configured ? '复制公网 HY2 连接' : 'HY2 未启用'}"${!item.enabled || !hy2Configured ? ' disabled' : ''}>HY2</button>
+            <button class="btn-action" data-action="copy-reality" data-id="${item.id}" title="${realityConfigured ? '复制公网 VLESS + RAW + Reality 链接' : 'VLESS 未启用'}"${!item.enabled || !realityConfigured ? ' disabled' : ''}>VLESS</button>
           </div>
+          <div class="node-actions" aria-label="节点管理">
           <button class="btn-action action-icon" data-action="test" data-id="${item.id}" title="检测上游连通性" aria-label="检测 ${name}"${coreDisabled}>${icon('refresh-cw')}</button>
           <button class="node-toggle" role="switch" aria-checked="${Boolean(item.enabled)}" data-action="${item.enabled ? 'disable' : 'enable'}" data-id="${item.id}" title="${item.enabled ? '禁用' : '启用'} ${name}" aria-label="启用 ${name}"><span></span></button>
-          <details class="tool-menu row-menu">
-            <summary class="btn-action action-icon" title="更多操作" aria-label="${name} 更多操作">${icon('ellipsis')}</summary>
-            <div class="menu-items">
-              <button data-action="copy-docker-http" data-id="${item.id}"${disabled}>Docker HTTP</button>
-              <button data-action="copy-docker-socks" data-id="${item.id}"${disabled}>Docker SOCKS5</button>
-              <button data-action="copy-public-http" data-id="${item.id}"${disabled}>公网 HTTP</button>
-              <button data-action="copy-public-socks" data-id="${item.id}"${disabled}>公网 SOCKS5</button>
+          <div class="tool-menu row-menu">
+            <button type="button" class="btn-action action-icon menu-trigger" popovertarget="node-menu-${item.id}" title="管理 ${name}" aria-label="${name} 更多操作">${icon('ellipsis')}</button>
+            <div class="menu-items" id="node-menu-${item.id}" popover>
+              <span class="menu-heading node-menu-name" title="${name}">${name}</span>
+              <button data-action="manage" data-id="${item.id}">${icon('settings')}节点设置</button>
               ${item.isLocal ? '' : `<button data-action="edit" data-id="${item.id}">编辑节点</button>`}
-              ${item.hy2 ? `<button data-action="${hy2Configured ? 'disable-hy2' : 'hy2'}" data-id="${item.id}"${disabled}>${hy2Configured ? '停用' : '启用'} HY2</button>` : ''}
-              <button data-action="reality" data-id="${item.id}">Reality 设置</button>
-              ${item.isLocal ? '<span class="menu-note">本机节点不可删除</span>' : `<button class="danger" data-action="remove" data-id="${item.id}">删除节点</button>`}
+              ${item.isLocal ? '<span class="menu-note">自身节点 · 禁止删除</span>' : `<button class="danger menu-danger" data-action="remove" data-id="${item.id}">删除节点</button>`}
             </div>
-          </details>
+          </div>
+          </div>
         </div>
       </td>
     </tr>
@@ -354,9 +398,9 @@ function updateSingleRowDom(item, force = false) {
   const markup = renderRowHtml(item, selectedNodeIds.has(item.id));
   if (rowElement.dataset.markup === markup) return;
   // Keep menus and in-flight actions stable; preserve focus during passive updates.
-  if (!force && rowElement.querySelector('details[open], [data-busy="true"]')) return;
+  if (!force && rowElement.querySelector('.menu-items:popover-open, [data-busy="true"]')) return;
   const focused = rowElement.contains(document.activeElement) ? document.activeElement : null;
-  const focusSelector = focused?.matches('.row-select') ? '.row-select' : focused?.dataset.action ? `[data-action="${focused.dataset.action}"]` : focused?.matches('summary') ? 'summary' : null;
+  const focusSelector = focused?.matches('.row-select') ? '.row-select' : focused?.dataset.action ? `[data-action="${focused.dataset.action}"]` : focused?.matches('.menu-trigger') ? '.menu-trigger' : null;
   rowElement.outerHTML = markup;
   const nextRow = document.querySelector(`#row-${item.id}`);
   nextRow.dataset.markup = markup;
@@ -403,18 +447,18 @@ function updateOverviewCards(status) {
  * 渲染或重绘整个节点列表
  * @param {Array<object>} listItems - 待渲染节点列表
  */
+function filteredItems(listItems) {
+  const keyword = nodeFilter.value.trim().toLowerCase();
+  return keyword ? listItems.filter((item) =>
+    `${item.name || ''} ${item.server || ''} ${item.upstreamPort || ''} ${item.listenPort || ''} ${item.reality?.listenPort || ''} ${item.protocol || ''} ${item.exitIp || ''} ${item.location || ''}`.toLowerCase().includes(keyword)) : listItems;
+}
+
 function render(listItems) {
   const existingIds = new Set(listItems.map((item) => item.id));
   for (const id of selectedNodeIds) if (!existingIds.has(id)) selectedNodeIds.delete(id);
   const selected = selectedIds();
-  const filterKeyword = (nodeFilter ? nodeFilter.value : '').trim().toLowerCase();
-
-  const filtered = filterKeyword
-    ? listItems.filter((it) => {
-        const text = `${it.name || ''} ${it.server || ''} ${it.listenPort || ''} ${it.protocol || ''} ${it.exitIp || ''} ${it.location || ''}`.toLowerCase();
-        return text.includes(filterKeyword);
-      })
-    : listItems;
+  const filterKeyword = nodeFilter.value.trim();
+  const filtered = filteredItems(listItems);
 
   if (!filtered.length) {
     rows.innerHTML = `
@@ -449,6 +493,25 @@ function getEffectiveHost(hostOverride) {
   return location.hostname || '127.0.0.1';
 }
 
+function currentCopyTarget() {
+  return copyScope.value === 'docker' ? { host: DOCKER_PROXY_HOST, label: 'Docker' }
+    : copyScope.value === 'public' ? { host: undefined, label: '公网' }
+    : { host: INTERNAL_PROXY_HOST, label: '本机' };
+}
+
+function updateCopyControls() {
+  const state = settings.proxyAccess?.publicTcp || 'unverified';
+  const option = copyScope.querySelector('[value="public"]');
+  option.disabled = state === 'blocked';
+  option.textContent = state === 'blocked' ? '公网 · 未开放' : '公网';
+  if (option.disabled && copyScope.value === 'public') copyScope.value = 'local';
+  const status = document.querySelector('#publicProxyStatus');
+  status.textContent = { blocked: '公网未开放', restricted: '公网按规则开放', unverified: '公网访问未核验' }[state];
+  status.title = settings.proxyAccess?.sources || status.textContent;
+  status.className = `access-state ${state}`;
+  document.querySelector('#copyScopeHeading').textContent = `${currentCopyTarget().label}连接`;
+}
+
 /**
  * 生成节点的公网或内网代理连接字符串
  * @param {object} item - 节点
@@ -472,6 +535,7 @@ function endpoint(item, scheme, host) {
  */
 async function copyItems(targetItems, scheme, host, label = scheme.toUpperCase()) {
   const relayField = { hy2: 'hy2', vless: 'reality' }[scheme];
+  if (!relayField && host === undefined && settings.proxyAccess?.publicTcp === 'blocked') throw new Error('公网 HTTP/SOCKS5 未开放');
   const enabledItems = targetItems.filter((item) => item.enabled && (!relayField || (item[relayField]?.status === 'enabled' && item[relayField].link)));
   if (!enabledItems.length) {
     throw new Error(relayField ? `请选择至少一个已启用 ${label} 的节点` : '请先选择至少一个已启用的节点');
@@ -505,20 +569,23 @@ async function refreshData(includeSettings) {
     document.querySelector('#syncTime').textContent = '同步失败';
     throw error;
   }
-  const previousIds = items.map((item) => item.id).join(',');
   items = nextItems;
   settings = nextSettings;
   serviceStatus = status;
-  if (includeSettings || nodeFilter.value.trim() || previousIds !== items.map((item) => item.id).join(',')) render(items);
+  updateCopyControls();
+  const visible = filteredItems(items);
+  const currentIds = [...rows.querySelectorAll('.node-row')].map((row) => row.dataset.id).join(',');
+  if (!visible.length || currentIds !== visible.map((item) => item.id).join(',')) render(items);
   else items.forEach((item) => updateSingleRowDom(item));
+  if (nodeSettingsDialog.open) {
+    const item = items.find((entry) => entry.id === nodeSettingsDialog.dataset.id);
+    if (item) renderNodeSettings(item);
+    else nodeSettingsDialog.close();
+  }
 
   // 同步设置表单
   if (includeSettings && !settingsDialog.open) {
-  settingsForm.proxyUsername.value = settings.proxyUsername || '';
-  settingsForm.proxyPassword.value = settings.proxyPassword || '';
-  settingsForm.publicHost.value = settings.publicHost || '';
-  document.querySelector('#subscriptionSocks').value = settings.subscriptions?.socks5 || '';
-  document.querySelector('#subscriptionHttp').value = settings.subscriptions?.http || '';
+    fillSettingsForm();
   }
 
   updateOverviewCards(status);
@@ -549,13 +616,77 @@ document.addEventListener('visibilitychange', () => {
   if (!document.hidden && (autoRefresh.checked || manualHealthCheck)) refresh(false).catch(() => {});
 });
 document.addEventListener('click', (event) => {
-  document.querySelectorAll('.tool-menu[open]').forEach((menu) => {
-    if (!menu.contains(event.target) || (!menu.classList.contains('docker-menu') && event.target.closest('button, a'))) menu.open = false;
-  });
+  const panel = event.target.closest('.menu-items');
+  if (panel?.matches(':popover-open') && !panel.classList.contains('docker-bubble') && event.target.closest('button, a')) panel.hidePopover();
 });
-document.addEventListener('keydown', (event) => {
-  if (event.key === 'Escape') document.querySelectorAll('.tool-menu[open]').forEach((menu) => { menu.open = false; });
-});
+
+function closeMenus() {
+  document.querySelectorAll('.menu-items:popover-open').forEach((panel) => panel.hidePopover());
+}
+
+// Native popovers handle light-dismiss and focus; only anchor/viewport placement is custom.
+function positionMenu(panel) {
+  const anchor = document.querySelector(`[popovertarget="${panel.id}"]`).getBoundingClientRect();
+  const viewport = window.visualViewport;
+  const left = (viewport?.offsetLeft || 0) + 8;
+  const top = (viewport?.offsetTop || 0) + 8;
+  const width = (viewport?.width || innerWidth) - 16;
+  const bottom = top + (viewport?.height || innerHeight) - 16;
+  if (anchor.bottom < top || anchor.top > bottom) { panel.hidePopover(); return; }
+  const above = Math.max(0, anchor.top - top - 6);
+  const below = Math.max(0, bottom - anchor.bottom - 6);
+  panel.style.maxWidth = `${width}px`;
+  panel.style.maxHeight = `${Math.min(bottom - top, Math.max(above, below))}px`;
+  const box = panel.getBoundingClientRect();
+  const y = box.height <= below || below >= above ? anchor.bottom + 6 : anchor.top - box.height - 6;
+  panel.style.left = `${Math.max(left, Math.min(anchor.right - box.width, left + width - box.width))}px`;
+  panel.style.top = `${Math.max(top, Math.min(y, bottom - box.height))}px`;
+  panel.dataset.positioned = 'true';
+}
+document.addEventListener('toggle', (event) => {
+  if (!event.target.matches('.menu-items[popover]')) return;
+  if (event.newState === 'open') positionMenu(event.target);
+  else delete event.target.dataset.positioned;
+}, true);
+document.addEventListener('scroll', (event) => {
+  if (!event.target.closest?.('.menu-items')) document.querySelectorAll('.menu-items:popover-open').forEach(positionMenu);
+}, true);
+window.addEventListener('resize', closeMenus);
+window.visualViewport?.addEventListener('resize', closeMenus);
+copyScope.addEventListener('change', () => { closeMenus(); updateCopyControls(); render(items); });
+
+function renderNodeSettings(item) {
+  const enabled = item.hy2?.status === 'enabled';
+  document.querySelector('#nodeSettingsTitle').textContent = item.name || item.server;
+  const content = document.querySelector('#nodeSettingsContent');
+  const markup = `
+    <section class="node-protocol-settings" aria-label="公网协议">
+      <div class="node-setting-row"><div><strong>HY2</strong><span class="setting-meta">UDP ${item.listenPort} · ${enabled ? '已启用' : item.hy2 ? '已停用' : '未配置'}</span></div>
+        <button type="button" class="node-toggle" role="switch" aria-checked="${enabled}" aria-label="启用 HY2" data-action="${enabled ? 'disable-hy2' : 'hy2'}" data-id="${item.id}"${!item.enabled ? ' disabled' : ''}><span></span></button>
+      </div>
+      <div class="node-setting-row"><div><strong>VLESS / Reality</strong><span class="setting-meta">${item.reality ? `TCP ${item.reality.listenPort} · ${item.reality.enabled ? '已启用' : '已停用'}` : '未配置'}</span></div>
+        <div class="node-setting-controls">
+          <button type="button" class="${item.reality ? 'icon-button' : 'button secondary btn-sm'}" data-action="reality" data-id="${item.id}" title="VLESS / Reality 参数设置" aria-label="VLESS / Reality 参数设置">${icon('settings')}${item.reality ? '' : '设置'}</button>
+          ${item.reality ? `<button type="button" class="node-toggle" role="switch" aria-checked="${item.reality.enabled}" aria-label="启用 VLESS / Reality" data-action="toggle-reality" data-id="${item.id}"${!item.enabled ? ' disabled' : ''}><span></span></button>` : ''}
+        </div>
+      </div>
+    </section>
+    ${item.hy2 || item.reality ? `<section class="node-danger-zone" aria-label="敏感操作"><h3>重置连接凭据</h3><div class="node-danger-actions">
+      ${item.hy2 ? `<button type="button" class="button danger btn-sm" data-action="rotate-hy2" data-id="${item.id}">${icon('refresh-cw')}重置 HY2 凭据</button>` : ''}
+      ${item.reality ? `<button type="button" class="button danger btn-sm" data-action="rotate-reality" data-id="${item.id}">${icon('refresh-cw')}重置 VLESS 凭据</button>` : ''}
+    </div></section>` : ''}`;
+  if (content.dataset.markup === markup) return;
+  const focusedAction = content.contains(document.activeElement) ? document.activeElement.dataset.action : null;
+  content.innerHTML = markup;
+  content.dataset.markup = markup;
+  if (focusedAction) content.querySelector(`[data-action="${focusedAction}"]`)?.focus();
+}
+
+function openNodeSettings(item) {
+  nodeSettingsDialog.dataset.id = item.id;
+  renderNodeSettings(item);
+  nodeSettingsDialog.showModal();
+}
 
 /**
  * 更新顶部导航栏的身份验证器徽章状态
@@ -575,8 +706,21 @@ function updateTotpBadge() {
 // 弹窗控制
 document.querySelector('#openAddDialog').addEventListener('click', () => addDialog.showModal());
 document.querySelector('#openImportDialog').addEventListener('click', () => importDialog.showModal());
-document.querySelector('#openSettingsDialog').addEventListener('click', () => settingsDialog.showModal());
-document.querySelector('#openPasswordDialog').addEventListener('click', () => passwordDialog.showModal());
+function fillSettingsForm() {
+  settingsForm.proxyUsername.value = settings.proxyUsername || '';
+  settingsForm.proxyPassword.value = settings.proxyPassword || '';
+  settingsForm.proxyPassword.type = 'password';
+  document.querySelector('#togglePassword').textContent = '显示';
+  settingsForm.publicHost.value = settings.publicHost || '';
+  document.querySelector('#subscriptionSocks').value = settings.subscriptions?.socks5 || '';
+  document.querySelector('#subscriptionHttp').value = settings.subscriptions?.http || '';
+}
+document.querySelector('#openSettingsDialog').addEventListener('click', () => { fillSettingsForm(); settingsDialog.showModal(); });
+document.querySelector('#openPasswordDialog').addEventListener('click', () => {
+  passwordDialog.querySelector('[data-password-totp]').hidden = !settings.totpEnabled;
+  passwordForm.elements.totpCode.required = Boolean(settings.totpEnabled);
+  passwordDialog.showModal();
+});
 passwordDialog.addEventListener('close', () => {
   passwordForm.reset();
   dialogFeedback(passwordDialog, '');
@@ -604,6 +748,7 @@ function openRealityModal(item) {
   document.querySelector('#realityPort').textContent = item.reality ? `TCP ${item.reality.listenPort}` : 'TCP 50000+ · 自动分配';
   document.querySelector('#copyRealityLink').disabled = !item.reality;
   document.querySelector('#removeReality').hidden = !item.reality;
+  document.querySelector('#rotateReality').hidden = !item.reality;
   dialogFeedback(realityDialog, '');
   realityDialog.showModal();
 }
@@ -623,6 +768,7 @@ realityForm.addEventListener('submit', async (event) => {
     document.querySelector('#realityPort').textContent = `TCP ${result.listenPort}`;
     document.querySelector('#copyRealityLink').disabled = false;
     document.querySelector('#removeReality').hidden = false;
+    document.querySelector('#rotateReality').hidden = false;
     dialogFeedback(realityDialog, result.enabled ? 'Reality 已启用' : 'Reality 已停用');
   } catch (error) { dialogFeedback(realityDialog, error.message, true); }
   finally { button.disabled = false; }
@@ -633,6 +779,21 @@ document.querySelector('#copyRealityLink').addEventListener('click', async () =>
     const item = items.find((entry) => entry.id === realityForm.dataset.id);
     await copyText(item.reality.link);
     dialogFeedback(realityDialog, 'VLESS Reality 链接已复制');
+  } catch (error) { dialogFeedback(realityDialog, error.message, true); }
+});
+
+async function rotateCredentials(item, protocol) {
+  const credentials = await requestReauth(`重置 ${protocol.toUpperCase()} 凭据`, '重置后旧连接立即失效，端口和出口保持不变。');
+  if (!credentials) return;
+  const route = protocol === 'hy2' ? `/api/relays/${item.hy2.id}/rotate` : `/api/proxies/${item.id}/reality/rotate`;
+  await api(route, { method: 'POST', body: JSON.stringify(credentials) });
+  await refresh();
+  showMessage('凭据已重置，请重新复制连接');
+}
+
+document.querySelector('#rotateReality').addEventListener('click', async () => {
+  try {
+    await rotateCredentials(items.find((item) => item.id === realityForm.dataset.id), 'vless');
   } catch (error) { dialogFeedback(realityDialog, error.message, true); }
 });
 
@@ -769,7 +930,7 @@ passwordForm.addEventListener('submit', async (event) => {
   const button = passwordForm.querySelector('[type="submit"]');
   button.disabled = true;
   try {
-    await api('/api/admin/password', { method: 'POST', body: JSON.stringify({ currentPassword, newPassword }) });
+    await api('/api/admin/password', { method: 'POST', body: JSON.stringify({ currentPassword, newPassword, totpCode: passwordForm.elements.totpCode.value }) });
     passwordForm.reset();
     if (settings.authDisabled) {
       passwordDialog.close();
@@ -792,6 +953,7 @@ document.querySelectorAll('[data-close]').forEach((button) => {
 });
 
 document.querySelectorAll('dialog').forEach((dialog) => {
+  dialog.addEventListener('close', () => dialog.querySelectorAll('.dialog-feedback').forEach((feedback) => { feedback.textContent = ''; }));
   dialog.addEventListener('click', (event) => {
     if (event.target === dialog) dialog.close();
   });
@@ -803,6 +965,11 @@ document.querySelector('#togglePassword').addEventListener('click', (event) => {
   const visible = input.type === 'text';
   input.type = visible ? 'password' : 'text';
   event.currentTarget.textContent = visible ? '显示' : '隐藏';
+});
+
+document.querySelector('#generateProxyPassword').addEventListener('click', () => {
+  const bytes = crypto.getRandomValues(new Uint8Array(24));
+  settingsForm.proxyPassword.value = btoa(String.fromCharCode(...bytes)).replace(/\+/g, '-').replace(/\//g, '_') + 'aA1!';
 });
 
 // 复制订阅链接
@@ -822,17 +989,12 @@ document.querySelectorAll('[data-copy-subscription]').forEach((button) => {
 
 // 轮换订阅密钥
 document.querySelector('#rotateSubscription').addEventListener('click', async (event) => {
-  const confirmed = await showConfirm({
-    title: '轮换订阅 Token',
-    message: '轮换 Token 后，旧订阅地址将立即失效。确定继续吗？',
-    confirmText: '确认轮换',
-    danger: true
-  });
-  if (!confirmed) return;
+  const credentials = await requestReauth('轮换订阅 Token', '旧订阅地址将立即失效。');
+  if (!credentials) return;
   const button = event.currentTarget;
   button.disabled = true;
   try {
-    settings = await api('/api/subscriptions/rotate', { method: 'POST' });
+    settings = await api('/api/subscriptions/rotate', { method: 'POST', body: JSON.stringify(credentials) });
     document.querySelector('#subscriptionSocks').value = settings.subscriptions.socks5;
     document.querySelector('#subscriptionHttp').value = settings.subscriptions.http;
     showMessage('内网订阅密钥已成功轮换');
@@ -943,9 +1105,13 @@ settingsForm.addEventListener('submit', async (event) => {
   button.disabled = true;
   button.textContent = '保存中...';
   try {
+    const changed = settingsForm.proxyUsername.value !== settings.proxyUsername || settingsForm.proxyPassword.value !== settings.proxyPassword;
+    const credentials = changed ? await requestReauth('更换代理凭据', '使用旧账号密码的 HTTP/SOCKS5 配置将失效。') : {};
+    if (!credentials) return;
     settings = await api('/api/settings', {
       method: 'PUT',
       body: JSON.stringify({
+        ...credentials,
         proxyUsername: settingsForm.proxyUsername.value,
         proxyPassword: settingsForm.proxyPassword.value,
         publicHost: settingsForm.publicHost.value
@@ -1014,25 +1180,17 @@ function getSelectedItems() {
 }
 
 // 批量快捷复制
-document.querySelector('#copyHttp').addEventListener('click', () => {
-  copyItems(getSelectedItems(), 'http', undefined, '公网 HTTP').catch((error) => showMessage(error.message, true));
-});
-document.querySelector('#copySocks').addEventListener('click', () => {
-  copyItems(getSelectedItems(), 'socks5', undefined, '公网 SOCKS5').catch((error) => showMessage(error.message, true));
-});
+for (const [id, scheme] of [['copyHttp', 'http'], ['copySocks', 'socks5']]) {
+  document.querySelector(`#${id}`).addEventListener('click', () => {
+    const target = currentCopyTarget();
+    copyItems(getSelectedItems(), scheme, target.host, `${target.label} ${scheme.toUpperCase()}`).catch((error) => showMessage(error.message, true));
+  });
+}
 document.querySelector('#copyHy2').addEventListener('click', () => {
   copyItems(getSelectedItems(), 'hy2').catch((error) => showMessage(error.message, true));
 });
 document.querySelector('#copyVless').addEventListener('click', () => {
   copyItems(getSelectedItems(), 'vless', undefined, 'VLESS Reality').catch((error) => showMessage(error.message, true));
-});
-document.querySelector('#copyInternalHttp').addEventListener('click', () => {
-  copyItems(getSelectedItems(), 'http', INTERNAL_PROXY_HOST, '本机 HTTP')
-    .catch((error) => showMessage(error.message, true));
-});
-document.querySelector('#copyInternalSocks').addEventListener('click', () => {
-  copyItems(getSelectedItems(), 'socks5', INTERNAL_PROXY_HOST, '本机 SOCKS5')
-    .catch((error) => showMessage(error.message, true));
 });
 for (const [id, scheme] of [['copyDockerHttp', 'http'], ['copyDockerSocks', 'socks5']]) {
   document.querySelector(`#${id}`).addEventListener('click', () => {
@@ -1087,18 +1245,35 @@ if (batchDeleteBtn) {
 }
 
 // 表格行动作委托（局部更新 + 后台自动静默测速）
-rows.addEventListener('click', async (event) => {
+async function handleNodeAction(event) {
   const button = event.target.closest('[data-action]');
-  if (!button) return;
+  if (!button || button.disabled) return;
 
   const { action, id } = button.dataset;
   const item = items.find((candidate) => candidate.id === id);
   if (!item) return;
 
-  if (action === 'reality') { openRealityModal(item); return; }
+  if (action === 'manage') { openNodeSettings(item); return; }
+  if (action === 'reality') { nodeSettingsDialog.close(); openRealityModal(item); return; }
+  if (action === 'rotate-hy2' || action === 'rotate-reality') {
+    try { await rotateCredentials(item, action === 'rotate-hy2' ? 'hy2' : 'vless'); }
+    catch (error) { showMessage(error.message, true); }
+    return;
+  }
   if (action === 'copy-reality') {
     try { await copyText(item.reality.link); showMessage(`已复制 ${item.name} 的 VLESS Reality 出口`); }
     catch (error) { showMessage(error.message, true); }
+    return;
+  }
+  if (action === 'toggle-reality') {
+    button.disabled = true;
+    const enabled = !item.reality.enabled;
+    try {
+      await api(`/api/proxies/${item.id}/reality`, { method: 'PUT', body: JSON.stringify({ enabled }) });
+      await refresh();
+      showMessage(`${item.name} VLESS 已${enabled ? '启用' : '停用'}`);
+    } catch (error) { showMessage(error.message, true); }
+    finally { button.disabled = false; }
     return;
   }
 
@@ -1111,6 +1286,7 @@ rows.addEventListener('click', async (event) => {
       await refresh();
       showMessage(`${item.name} HY2 已${action === 'disable-hy2' ? '停用' : '启用'}，端口 ${item.listenPort}`);
     } catch (error) {
+      nodeSettingsDialog.close();
       await openRelayModal();
       dialogFeedback(relayDialog, error.message, true);
     } finally { button.disabled = false; }
@@ -1126,13 +1302,11 @@ rows.addEventListener('click', async (event) => {
   }
 
   // 1. 复制
-  if (['copy-http', 'copy-socks', 'copy-docker-http', 'copy-docker-socks', 'copy-public-http', 'copy-public-socks'].includes(action)) {
+  if (['copy-http', 'copy-socks'].includes(action)) {
     try {
-      const docker = action.startsWith('copy-docker-');
-      const external = action.startsWith('copy-public-');
+      const target = currentCopyTarget();
       const scheme = action.endsWith('http') ? 'http' : 'socks5';
-      await copyItems([item], scheme, docker ? DOCKER_PROXY_HOST : external ? undefined : INTERNAL_PROXY_HOST,
-        `${docker ? 'Docker' : external ? '公网' : '本机'} ${scheme.toUpperCase()}`);
+      await copyItems([item], scheme, target.host, `${target.label} ${scheme.toUpperCase()}`);
     } catch (error) {
       showMessage(error.message, true);
     }
@@ -1226,7 +1400,9 @@ rows.addEventListener('click', async (event) => {
     delete button.dataset.busy;
     button.textContent = originalLabel;
   }
-});
+}
+rows.addEventListener('click', handleNodeAction);
+nodeSettingsDialog.addEventListener('click', handleNodeAction);
 
 // ==========================================
 // Google 身份验证器 (TOTP) 管理逻辑（标准 SVG 矢量渲染）
@@ -1292,13 +1468,13 @@ totpBindForm.addEventListener('submit', async (event) => {
   try {
     await api('/api/totp/verify-bind', {
       method: 'POST',
-      body: JSON.stringify({ code, secret: currentTotpSetup.secret })
+      body: JSON.stringify({ code, secret: currentTotpSetup.secret, currentPassword: totpBindForm.elements.currentPassword.value })
     });
     settings.totpEnabled = true;
     updateTotpBadge();
-    showMessage('Google 身份验证器已成功激活！下次可使用 6 位验证码秒级登录。');
+    showMessage('双重验证已启用，请使用密码和动态验证码重新登录。');
     input.value = '';
-    await openTotpModal();
+    location.assign('/login');
   } catch (error) {
     showMessage(error.message, true);
   } finally {
@@ -1308,40 +1484,23 @@ totpBindForm.addEventListener('submit', async (event) => {
 });
 
 // 停用 TOTP
-document.querySelector('#btnDisableTotp').addEventListener('click', async () => {
-  const confirmed = await showConfirm({
-    title: '停用身份验证器',
-    message: '停用后将不能使用 6 位动态验证码登录，只能使用静态密码。确定停用？',
-    confirmText: '确定停用',
-    danger: true
-  });
-  if (!confirmed) return;
+async function disableTotp() {
+  const credentials = await requestReauth('停用身份验证器', '停用后只验证密码，所有会话将失效。');
+  if (!credentials) return;
   try {
-    await api('/api/totp/disable', { method: 'POST' });
+    await api('/api/totp/disable', { method: 'POST', body: JSON.stringify(credentials) });
     settings.totpEnabled = false;
     updateTotpBadge();
     showMessage('Google 身份验证器已停用');
-    await openTotpModal();
+    location.assign('/login');
   } catch (error) {
     showMessage(error.message, true);
   }
-});
+}
+document.querySelector('#btnDisableTotp').addEventListener('click', disableTotp);
 
 // 重新绑定 TOTP
-document.querySelector('#btnRebindTotp').addEventListener('click', async () => {
-  const setupArea = document.querySelector('#totpSetupArea');
-  const manageArea = document.querySelector('#totpManageArea');
-  setupArea.style.display = 'grid';
-  manageArea.style.display = 'none';
-
-  const data = await api('/api/totp/setup');
-  currentTotpSetup = data;
-  document.querySelector('#totpSecretText').textContent = data.secret;
-  const qrContainer = document.querySelector('#totpQrContainer');
-  if (qrContainer) {
-    qrContainer.innerHTML = data.qrSvg || '';
-  }
-});
+document.querySelector('#btnRebindTotp').addEventListener('click', disableTotp);
 
 // 初始化刷新
 refresh().catch((error) => showMessage(error.message, true));

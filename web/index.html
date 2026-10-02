@@ -37,9 +37,9 @@
           <span class="btn-icon">📋</span>
           <span>连接日志</span>
         </a>
-        <details class="tool-menu settings-menu">
-          <summary class="button secondary" title="设置" aria-label="设置"><svg class="tool-icon" aria-hidden="true"><use href="/lucide.svg#settings"></use></svg><span>设置</span></summary>
-          <div class="menu-items">
+        <div class="tool-menu settings-menu">
+          <button class="button secondary menu-trigger" type="button" popovertarget="settingsMenu" title="设置" aria-label="设置"><svg class="tool-icon" aria-hidden="true"><use href="/lucide.svg#settings"></use></svg><span>设置</span></button>
+          <div class="menu-items" id="settingsMenu" popover>
         <button id="openTotpDialog" type="button" title="绑定或管理 Google 身份验证器">
           <span class="btn-icon">🛡️</span>
           <span>身份验证器</span>
@@ -58,7 +58,7 @@
           <span>HY2 设置</span>
         </button>
           </div>
-        </details>
+        </div>
         <button id="openAddDialog" class="button primary btn-with-icon" type="button">
           <svg class="tool-icon" aria-hidden="true"><use href="/lucide.svg#plus"></use></svg>
           <span>添加节点</span>
@@ -121,34 +121,32 @@
 
           <!-- 搜索框与快捷过滤 -->
           <div class="search-filter-wrap">
-            <input id="nodeFilter" class="search-input" type="text" placeholder="🔍 快速搜索节点名称、IP、端口、协议..." autocomplete="off">
+            <input id="nodeFilter" class="search-input" type="search" aria-label="搜索节点" placeholder="搜索名称、IP、端口或协议" autocomplete="off">
           </div>
 
           <!-- 批量与快捷工具栏 -->
           <div class="toolbar">
-            <details class="tool-menu">
-              <summary class="button secondary btn-sm">节点文件</summary>
-              <div class="menu-items">
+            <div class="tool-menu file-menu">
+              <button class="button secondary btn-sm menu-trigger" type="button" popovertarget="fileMenu">节点文件</button>
+              <div class="menu-items" id="fileMenu" popover>
                 <button id="openImportDialog" type="button">导入节点</button>
                 <a id="exportNodes" href="/api/proxies/export" download="proxypoolhub-nodes.json" title="上游链接含代理凭据">导出节点</a>
               </div>
-            </details>
-            <details class="tool-menu copy-menu" id="copyMenu">
-              <summary class="button secondary btn-sm">复制所选</summary>
-              <div class="menu-items">
-                <span class="menu-heading">本机使用</span>
-                <button id="copyInternalHttp" type="button" title="仅限本机访问：127.0.0.1">本机 HTTP</button>
-                <button id="copyInternalSocks" type="button" title="仅限本机访问：127.0.0.1">本机 SOCKS5</button>
-                <span class="menu-heading">外部使用</span>
+            </div>
+            <div class="tool-menu copy-menu" id="copyMenu">
+              <button class="button secondary btn-sm menu-trigger" type="button" popovertarget="selectedCopyMenu"><svg class="tool-icon" aria-hidden="true"><use href="/lucide.svg#copy"></use></svg>复制所选</button>
+              <div class="menu-items" id="selectedCopyMenu" popover>
+                <span class="menu-heading" id="copyScopeHeading">本机连接</span>
+                <button id="copyHttp" type="button">HTTP</button>
+                <button id="copySocks" type="button">SOCKS5</button>
+                <span class="menu-heading">公网加密连接</span>
                 <button id="copyHy2" type="button" title="复制已开启 HY2 的公网连接">HY2</button>
                 <button id="copyVless" type="button" title="复制已开启 VLESS Reality 的公网连接">VLESS Reality</button>
-                <button id="copyHttp" type="button" title="通过公网地址访问 HTTP 代理">公网 HTTP</button>
-                <button id="copySocks" type="button" title="通过公网地址访问 SOCKS5 代理">公网 SOCKS5</button>
               </div>
-            </details>
-            <details class="tool-menu docker-menu" id="dockerMenu">
-              <summary class="button secondary btn-sm" title="Docker 代理地址及 Compose 配置">Docker</summary>
-              <div class="menu-items docker-bubble">
+            </div>
+            <div class="tool-menu docker-menu" id="dockerMenu">
+              <button class="button secondary btn-sm menu-trigger" type="button" popovertarget="dockerBubble" title="Docker 代理地址及 Compose 配置">Docker</button>
+              <div class="menu-items docker-bubble" id="dockerBubble" popover>
                 <div class="docker-bubble-heading"><strong>Docker 代理</strong><code>host</code></div>
                 <div class="docker-copy-actions">
                   <button id="copyDockerHttp" type="button" title="复制所选节点的 Docker HTTP 地址">复制 HTTP</button>
@@ -163,7 +161,7 @@
                 <p class="docker-note">同一台宿主机 · 默认 Bridge 网络</p>
                 <p class="docker-note">片段合并到现有服务；host 是短主机别名，不需要新建网络。宿主机代理需允许 Docker 网段访问。</p>
               </div>
-            </details>
+            </div>
             <span id="batchDeleteDivider" class="toolbar-divider" aria-hidden="true" style="display: none;"></span>
             <button id="batchDelete" class="button danger btn-sm" type="button" title="批量删除所有选中的节点" style="display: none;">
               <span class="btn-icon">🗑️</span>
@@ -178,9 +176,20 @@
           </div>
         </div>
         <div class="sync-bar">
-          <label class="visible-select"><input type="checkbox" id="mobileSelectAll">全选当前结果</label>
-          <span id="syncTime" role="status">尚未同步</span>
-          <label><input id="autoRefresh" type="checkbox" checked>自动更新</label>
+          <div class="copy-scope">
+            <label for="copyScope">HTTP / SOCKS5</label>
+            <select id="copyScope" aria-label="HTTP 和 SOCKS5 复制场景">
+              <option value="local">本机</option>
+              <option value="docker">Docker</option>
+              <option value="public">公网</option>
+            </select>
+            <span id="publicProxyStatus" class="access-state" role="status"></span>
+          </div>
+          <div class="sync-status">
+            <label class="visible-select"><input type="checkbox" id="mobileSelectAll">全选当前结果</label>
+            <span id="syncTime" role="status">尚未同步</span>
+            <label><input id="autoRefresh" type="checkbox" checked>自动更新</label>
+          </div>
         </div>
 
         <!-- 节点数据表格 -->
@@ -199,7 +208,7 @@
                 <th class="col-latency">延迟</th>
                 <th class="col-port">接入端口</th>
                 <th class="col-status" title="本机 SOCKS5 / TLS 探测，不代表外部 HY2/VLESS 可达">上游检测</th>
-                <th class="col-actions">操作</th>
+                <th class="col-actions">复制连接 / 管理</th>
               </tr>
             </thead>
             <tbody id="rows">
@@ -304,6 +313,16 @@
     </div>
   </dialog>
 
+  <dialog id="nodeSettingsDialog" class="modal" aria-labelledby="nodeSettingsTitle">
+    <div class="modal-box node-settings-box">
+      <div class="modal-header">
+        <div><span class="modal-kicker">节点设置</span><h2 id="nodeSettingsTitle"></h2></div>
+        <button class="icon-button" type="button" data-close="nodeSettingsDialog" aria-label="关闭节点设置">×</button>
+      </div>
+      <div id="nodeSettingsContent"></div>
+    </div>
+  </dialog>
+
   <!-- 弹窗 4: 访问与内网设置 -->
   <dialog id="settingsDialog" class="modal">
     <div class="modal-box">
@@ -328,6 +347,7 @@
             </div>
           </label>
         </div>
+        <button id="generateProxyPassword" class="button secondary" type="button"><svg class="tool-icon" aria-hidden="true"><use href="/lucide.svg#refresh-cw"></use></svg>生成代理新密码</button>
         <label>
           <span>对外公开地址 / 域名</span>
           <input id="publicHost" name="publicHost" placeholder="例如：vps.example.com 或公网 IPv4，留空则使用当前访问地址">
@@ -419,6 +439,7 @@
         </label>
         <label class="checkbox-label"><input name="enabled" type="checkbox"><span>启用 Reality</span></label>
         <div class="modal-actions">
+          <button class="button danger" type="button" id="rotateReality" hidden><svg class="tool-icon" aria-hidden="true"><use href="/lucide.svg#refresh-cw"></use></svg>重置凭据</button>
           <button class="button secondary" type="button" id="removeReality" title="删除 Reality 入口" hidden>删除</button>
           <button class="button secondary" type="button" id="copyRealityLink" disabled><svg class="tool-icon" aria-hidden="true"><use href="/lucide.svg#copy"></use></svg>复制链接</button>
           <button class="button primary" type="submit">保存</button>
@@ -446,6 +467,7 @@
           <span>确认新密码</span>
           <input name="confirmPassword" type="password" autocomplete="new-password" minlength="12" required>
         </label>
+        <label data-password-totp hidden><span>动态验证码</span><input name="totpCode" inputmode="numeric" autocomplete="one-time-code" pattern="[0-9]{6}" maxlength="6"></label>
         <p class="dialog-feedback" role="alert" aria-live="polite"></p>
         <div class="modal-actions">
           <button class="button secondary" type="button" data-close="passwordDialog">取消</button>
@@ -472,7 +494,7 @@
           <span class="banner-icon">🛡️</span>
           <div>
             <strong id="totpStatusText">正在检查验证器状态...</strong>
-            <p id="totpStatusDesc">绑定后可直接使用手机 6 位动态验证码快捷登录，无需死记静态长密码。</p>
+            <p id="totpStatusDesc">开启后，登录需要同时验证管理密码和手机动态验证码。</p>
           </div>
         </div>
 
@@ -492,6 +514,7 @@
 
             <!-- 输入验证码以完成绑定 -->
             <form id="totpBindForm" class="totp-verify-form">
+              <label><span>当前管理员密码</span><div class="input-wrap"><input name="currentPassword" type="password" autocomplete="current-password" required></div></label>
               <label for="totpVerifyInput">
                 <span>输入 App 上的 6 位验证码以激活绑定：</span>
               </label>
@@ -509,7 +532,7 @@
             <span class="check-icon">✓</span>
             <div>
               <strong>身份验证器已正常启用</strong>
-              <p>您现在可以在登录时直接选择“验证码登录”，输入 6 位动态码快速登录。</p>
+              <p>密码与动态验证码均验证通过后才能登录。</p>
             </div>
           </div>
           <div class="totp-danger-actions">
@@ -526,6 +549,17 @@
   </dialog>
 
   <!-- 美化操作确认对话框 -->
+  <dialog id="reauthDialog" class="modal">
+    <div class="modal-box">
+      <div class="modal-header"><h2 id="reauthTitle">验证身份</h2><button class="icon-button" type="button" data-close="reauthDialog" aria-label="关闭">×</button></div>
+      <form id="reauthForm" class="modal-form">
+        <p id="reauthMessage" class="form-hint"></p>
+        <label><span>当前管理员密码</span><input name="currentPassword" type="password" autocomplete="current-password" required autofocus></label>
+        <label id="reauthTotp"><span>动态验证码</span><input name="totpCode" inputmode="numeric" autocomplete="one-time-code" pattern="[0-9]{6}" maxlength="6"></label>
+        <div class="modal-actions"><button class="button secondary" type="button" data-close="reauthDialog">取消</button><button class="button danger" type="submit">验证并继续</button></div>
+      </form>
+    </div>
+  </dialog>
   <dialog id="confirmDialog" class="modal confirm-modal">
     <div class="modal-card confirm-card">
       <div class="confirm-header">

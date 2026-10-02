@@ -40,11 +40,11 @@ install_base_tools() {
     echo -e "${YELLOW}[1/6] 检查系统基础工具...${NC}"
     if command -v apt-get >/dev/null 2>&1; then
         apt-get update -y >/dev/null 2>&1 || true
-        apt-get install -y curl tar git openssl >/dev/null 2>&1
+        apt-get install -y curl tar git openssl nftables >/dev/null 2>&1
     elif command -v yum >/dev/null 2>&1; then
-        yum install -y curl tar git openssl >/dev/null 2>&1
+        yum install -y curl tar git openssl nftables >/dev/null 2>&1
     elif command -v apk >/dev/null 2>&1; then
-        apk add --no-cache curl tar git openssl bash
+        apk add --no-cache curl tar git openssl bash nftables
     fi
 }
 
@@ -104,14 +104,13 @@ install_dependencies() {
         sed -i "s/^ADMIN_PASSWORD=.*/ADMIN_PASSWORD=${rand_admin_pass}/" .env 2>/dev/null || echo "ADMIN_PASSWORD=${rand_admin_pass}" >> .env
         sed -i "s/^PROXY_PASSWORD=.*/PROXY_PASSWORD=${rand_proxy_pass}/" .env 2>/dev/null || echo "PROXY_PASSWORD=${rand_proxy_pass}" >> .env
         sed -i "s/^WEB_PORT=.*/WEB_PORT=3100/" .env 2>/dev/null || echo "WEB_PORT=3100" >> .env
-        sed -i "s/^WEB_HOST=.*/WEB_HOST=0.0.0.0/" .env 2>/dev/null || echo "WEB_HOST=0.0.0.0" >> .env
         sed -i "s/^PROXY_LISTEN_ADDRESS=.*/PROXY_LISTEN_ADDRESS=0.0.0.0/" .env 2>/dev/null || echo "PROXY_LISTEN_ADDRESS=0.0.0.0" >> .env
         chmod 600 .env
         echo -e "${GREEN}✓ 已自动生成随机安全管理员密码并保存到 .env${NC}"
-    else
-        sed -i "s/^WEB_HOST=127.0.0.1/WEB_HOST=0.0.0.0/" .env 2>/dev/null || true
-        sed -i "s/^PROXY_LISTEN_ADDRESS=127.0.0.1/PROXY_LISTEN_ADDRESS=0.0.0.0/" .env 2>/dev/null || true
     fi
+    sed -i '/^MANAGE_FIREWALL=/d; /^REQUIRE_AUTH=/d' .env
+    printf '\nMANAGE_FIREWALL=true\nREQUIRE_AUTH=true\n' >> .env
+    chmod 600 .env
 
     # 初始化示例节点数据
     if [ ! -f "data/proxies.json" ]; then
@@ -196,7 +195,7 @@ web_port=$(grep '^WEB_PORT=' "$app_dir/.env" 2>/dev/null | cut -d= -f2 || echo "
 echo -e "\n${GREEN}====================================================${NC}"
 echo -e "${GREEN}           🎉 ProxyPoolHub 部署完成！               ${NC}"
 echo -e "${GREEN}====================================================${NC}"
-echo -e "Web 管理面板:   ${BLUE}http://${server_ip}:${web_port}${NC}"
+echo -e "Web 管理面板:   ${BLUE}http://127.0.0.1:${web_port}（SSH 隧道或 HTTPS 反代访问）${NC}"
 echo -e "管理员账号:     ${YELLOW}${admin_user}${NC}"
 echo -e "管理员密码:     ${GREEN}${admin_pass}${NC}"
 echo -e "代理认证账号:   ${YELLOW}${proxy_user}${NC}"
@@ -209,4 +208,5 @@ echo -e "服务实时日志:   ${YELLOW}pph logs${NC}"
 echo -e "重启 / 更新:    ${YELLOW}pph restart / pph update${NC}"
 echo -e "Reality 端口:   ${BLUE}50000-50100/TCP，按节点开启${NC}"
 echo -e "配置文件路径:   ${BLUE}${app_dir}/.env${NC}"
+echo -e "访问控制:       ${BLUE}HTTP/SOCKS5 仅本机与 Docker；HY2/VLESS 按启用状态开放${NC}"
 echo -e "${GREEN}====================================================${NC}\n"
