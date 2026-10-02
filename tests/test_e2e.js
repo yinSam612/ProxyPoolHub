@@ -93,6 +93,9 @@ async function run() {
             WEB_PORT: String(TEST_PORT),
             WEB_HOST: '127.0.0.1',
             REQUIRE_AUTH: 'true',
+            MANAGE_FIREWALL: 'false',
+            TRUSTED_PROXY_CIDRS: '',
+            WEB_ALLOWED_CIDRS: '127.0.0.1/32,::1/128',
             PROXY_START_PORT: '42000',
             PROXY_LOCAL_PORT: '41999',
             PROXY_PUBLISHED_LAST_PORT: '42050',
@@ -102,7 +105,8 @@ async function run() {
     });
 
     serverProc.stdout.on('data', (d) => process.stdout.write(`[Server stdout] ${d}`));
-    serverProc.stderr.on('data', (d) => process.stderr.write(`[Server stderr] ${d}`));
+    let capturedStderr = '';
+    serverProc.stderr.on('data', (d) => { capturedStderr += d; process.stderr.write(`[Server stderr] ${d}`); });
     let occupiedSocket = null;
     let occupiedTcp = null;
 
@@ -127,16 +131,26 @@ async function run() {
         // 2. 测试获取登录页面并检查 HTML 结构
         const loginPageRes = await request({ path: '/login', method: 'GET' });
         assert.strictEqual(loginPageRes.status, 200);
+        assert.strictEqual(loginPageRes.headers['referrer-policy'], 'same-origin');
         assert.strictEqual(loginPageRes.body.includes('ProxyPoolHub'), true);
         assert.strictEqual(loginPageRes.body.includes('Google 动态验证码'), true);
-        console.log('✓ 2. 登录页面成功渲染双模式 Tab 结构');
+        assert.ok(!loginPageRes.body.includes('无需复杂密码'));
+        console.log('✓ 2. 登录页面始终要求密码，并按启用状态显示动态验证码');
 
         // 3. 使用初始静态密码登录
         const loginPost = `username=${encodeURIComponent(ADMIN_USER)}&password=${encodeURIComponent(ADMIN_PASS)}`;
+        for (const origin of ['null', 'not-a-url', 'https://attacker.example']) {
+            const rejected = await request({ path: '/login', method: 'POST', headers: {
+                'Content-Type': 'application/x-www-form-urlencoded', Origin: origin
+            } }, loginPost);
+            assert.strictEqual(rejected.status, 403, 'Invalid or opaque origins must be rejected without a URL parsing error');
+        }
         const loginRes = await request({
             path: '/login',
             method: 'POST',
             headers: {
+                Origin: `http://127.0.0.1:${TEST_PORT}`,
+                'Sec-Fetch-Site': 'same-origin',
                 'Content-Type': 'application/x-www-form-urlencoded',
                 'Content-Length': Buffer.byteLength(loginPost)
             }
@@ -158,6 +172,12 @@ async function run() {
         const statusData = JSON.parse(statusRes.body);
         assert.strictEqual(statusData.service, 'running');
         console.log('✓ 4. 鉴权访问 /api/status 成功');
+        const accessSettings = JSON.parse((await request({ path: '/api/settings', headers: { Cookie: sessionCookie } })).body);
+        assert.strictEqual(accessSettings.proxyAccess.publicTcp, 'blocked', 'loopback-bound proxies must not advertise public access');
+        const invalidProxy = await request({ port: 41999, path: 'http://api.ipify.org/', headers: { Host: 'api.ipify.org', 'Proxy-Authorization': `Basic ${Buffer.from('wrong:proxypassword').toString('base64')}` } });
+        assert.strictEqual(invalidProxy.status, 407);
+        await sleep(50);
+        assert.ok(capturedStderr.includes('password=[redacted]') && !capturedStderr.includes('password=proxypassword'), '真实内核认证失败日志必须脱敏');
 
         // 5. 获取 TOTP 配置信息
         const totpSetupRes = await request({
@@ -173,7 +193,7 @@ async function run() {
 
         // 6. 绑定 TOTP（动态验证码校验）
         const validTotpCode = totp.generateTotp(totpSetupData.secret);
-        const bindPayload = JSON.stringify({ code: validTotpCode, secret: totpSetupData.secret });
+        const bindPayload = JSON.stringify({ code: validTotpCode, secret: totpSetupData.secret, currentPassword: ADMIN_PASS });
         const bindRes = await request({
             path: '/api/totp/verify-bind',
             method: 'POST',
@@ -195,9 +215,15 @@ async function run() {
         assert.strictEqual(logoutRes.status, 303);
         console.log('✓ 7. 成功登出');
 
-        // 8. 核心关键测试：【仅使用账号 + Google 身份验证器 6 位动态验证码】直接快捷登录（无需长密码）
+        // Both factors are required; Basic authentication cannot bypass MFA.
         const newTotpCode = totp.generateTotp(totpSetupData.secret);
-        const totpLoginPayload = `username=${encodeURIComponent(ADMIN_USER)}&totpCode=${encodeURIComponent(newTotpCode)}`;
+        const onlyTotp = `username=${ADMIN_USER}&totpCode=${newTotpCode}`;
+        const loginHeaders = { 'Content-Type': 'application/x-www-form-urlencoded' };
+        assert.strictEqual((await request({ path: '/login', method: 'POST', headers: loginHeaders }, onlyTotp)).status, 401);
+        assert.strictEqual((await request({ path: '/login', method: 'POST', headers: loginHeaders }, loginPost)).status, 401);
+        assert.strictEqual((await request({ path: '/api/status', headers: { Authorization: `Basic ${Buffer.from(`${ADMIN_USER}:${ADMIN_PASS}`).toString('base64')}` } })).status, 401);
+        assert.strictEqual((await request({ path: '/api/status', headers: { Cookie: sessionCookie } })).status, 401, '开启 MFA 使旧会话失效');
+        const totpLoginPayload = `${loginPost}&totpCode=${newTotpCode}`;
         const totpLoginRes = await request({
             path: '/login',
             method: 'POST',
@@ -208,8 +234,17 @@ async function run() {
         }, totpLoginPayload);
 
         assert.strictEqual(totpLoginRes.status, 303, 'TOTP 动态码登录应当成功重定向');
-        const totpSessionCookie = totpLoginRes.headers['set-cookie'][0].split(';')[0];
-        console.log('✓ 8. 【重点特性通过】使用 Google Authenticator 6 位动态码成功免密登录！');
+        let totpSessionCookie = totpLoginRes.headers['set-cookie'][0].split(';')[0];
+        assert.strictEqual((await request({ path: '/login', method: 'POST', headers: loginHeaders }, totpLoginPayload)).status, 401, '已使用的验证码不能重复登录');
+        const enabledSetup = JSON.parse((await request({ path: '/api/totp/setup', headers: { Cookie: totpSessionCookie } })).body);
+        assert.strictEqual(enabledSetup.secret, undefined, '已启用的 TOTP 密钥不能再次读取');
+        assert.strictEqual((await request({ path: '/api/totp/disable', method: 'POST', headers: { Cookie: totpSessionCookie, 'Content-Type': 'application/json' } }, JSON.stringify({ currentPassword: ADMIN_PASS }))).status, 403);
+        const disabledTotp = await request({ path: '/api/totp/disable', method: 'POST', headers: { Cookie: totpSessionCookie, 'Content-Type': 'application/json' } }, JSON.stringify({ currentPassword: ADMIN_PASS, totpCode: newTotpCode }));
+        assert.strictEqual(disabledTotp.status, 200);
+        assert.strictEqual((await request({ path: '/api/status', headers: { Cookie: totpSessionCookie } })).status, 401);
+        const freshLogin = await request({ path: '/login', method: 'POST', headers: loginHeaders }, loginPost);
+        totpSessionCookie = freshLogin.headers['set-cookie'][0].split(';')[0];
+        console.log('✓ 8. 密码+TOTP、禁止密码/验证码/Basic 绕过、防重放、敏感操作重认证和旧会话失效通过');
 
         // 9. 性能测试：验证节点操作是否不再卡顿
         const listRes = await request({
@@ -403,6 +438,15 @@ async function run() {
         assert.strictEqual((await relayApi(realityPath, 'PUT', { host: '203.0.113.10', enabled: 'false' })).status, 400);
         assert.strictEqual(JSON.parse((await relayApi(realityPath, 'PUT', { host: '203.0.113.10' })).body).link, reality.link);
         assert.deepStrictEqual(JSON.parse(fs.readFileSync(TEMP_DATA_FILE)).proxies.find((item) => item.id === 'test-node-1').reality, credentials);
+        assert.strictEqual((await relayApi(`${realityPath}/rotate`, 'POST', {})).status, 403);
+        const rotatedReality = JSON.parse((await relayApi(`${realityPath}/rotate`, 'POST', { currentPassword: ADMIN_PASS })).body);
+        assert.strictEqual(rotatedReality.listenPort, reality.listenPort);
+        assert.notStrictEqual(new URL(rotatedReality.link).username, realityUrl.username);
+        assert.notStrictEqual(JSON.parse(fs.readFileSync(TEMP_DATA_FILE)).proxies.find((item) => item.id === 'test-node-1').reality.privateKey, credentials.privateKey);
+        const currentRelay = JSON.parse((await relayApi('/api/relays')).body).relays[0];
+        const rotatedHy2 = JSON.parse((await relayApi(`/api/relays/${currentRelay.id}/rotate`, 'POST', { currentPassword: ADMIN_PASS })).body);
+        assert.strictEqual(rotatedHy2.listenPort, currentRelay.listenPort);
+        assert.notStrictEqual(new URL(rotatedHy2.link).username, new URL(currentRelay.link).username);
         const realityOutbound = () => relayConfig().route.rules.find((rule) => rule.inbound.includes('reality-test-node-1'))?.outbound;
         assert.strictEqual(realityOutbound(), 'proxy-0');
         execFileSync(binary, ['check', '-c', path.join(TEMP_RUNTIME_DIR, 'temp_singbox_config.json')]);
@@ -420,8 +464,14 @@ async function run() {
         assert.deepStrictEqual(JSON.parse((await relayApi('/api/relays')).body).relays.map((item) => item.id), [relay.id]);
         assert.strictEqual((await relayApi('/api/proxies/test-node-1/enable', 'POST')).status, 200);
         assert.strictEqual(realityOutbound(), 'proxy-0');
+        const realityBeforeToggle = JSON.parse(fs.readFileSync(TEMP_DATA_FILE)).proxies.find((item) => item.id === 'test-node-1').reality;
+        const otherInbounds = relayConfig().inbounds.filter(item => item.type !== 'vless');
         assert.strictEqual((await relayApi(realityPath, 'PUT', { enabled: false })).status, 200);
         assert.strictEqual(realityOutbound(), undefined);
+        assert.deepStrictEqual(relayConfig().inbounds, otherInbounds, 'VLESS 停用不能改变 HTTP/SOCKS5 和 HY2 入口');
+        assert.strictEqual(relayOutbound(), 'proxy-0');
+        assert.deepStrictEqual(JSON.parse(fs.readFileSync(TEMP_DATA_FILE)).proxies.find((item) => item.id === 'test-node-1').reality,
+            { ...realityBeforeToggle, enabled: false }, '单独停用应保留端口、UUID 和密钥');
         occupiedTcp = net.createServer();
         await new Promise((resolve, reject) => { occupiedTcp.once('error', reject); occupiedTcp.listen(reality.listenPort, '127.0.0.1', resolve); });
         assert.strictEqual((await relayApi(realityPath, 'PUT', { enabled: true })).status, 400, '重新启用时端口被占用应回滚配置');
@@ -430,6 +480,7 @@ async function run() {
         occupiedTcp = null;
         assert.strictEqual((await relayApi(realityPath, 'PUT', { enabled: true })).status, 200);
         assert.strictEqual(realityOutbound(), 'proxy-0');
+        assert.deepStrictEqual(JSON.parse(fs.readFileSync(TEMP_DATA_FILE)).proxies.find((item) => item.id === 'test-node-1').reality, realityBeforeToggle);
         assert.strictEqual((await relayApi(`/api/relays/${relay.id}`, 'DELETE')).status, 200);
         const replacement = JSON.parse((await relayApi('/api/relays', 'POST', { proxyId: 'test-node-1' })).body);
         assert.strictEqual((await relayApi(`/api/relays/${replacement.id}`, 'DELETE')).status, 200);
@@ -471,6 +522,14 @@ async function run() {
         const stored = JSON.parse(fs.readFileSync(TEMP_DATA_FILE, 'utf8'));
         assert.ok(/^scrypt:[a-f0-9]{32}:[a-f0-9]{128}$/.test(stored.settings.adminPasswordHash));
         assert.ok(!fs.readFileSync(TEMP_DATA_FILE, 'utf8').includes(nextPassword));
+        assert.strictEqual((await request({ path: '/api/settings', method: 'PUT', headers: { Authorization: `Basic ${Buffer.from(`${ADMIN_USER}:${nextPassword}`).toString('base64')}`, 'Content-Type': 'application/json' } }, JSON.stringify({ proxyUsername: 'proxy', proxyPassword: 'aaaaaaaaaaaaaaaa', currentPassword: nextPassword }))).status, 400, '弱代理新密码必须拒绝');
+        assert.strictEqual((await request({ path: '/api/settings', method: 'PUT', headers: { Authorization: `Basic ${Buffer.from(`${ADMIN_USER}:${nextPassword}`).toString('base64')}`, Origin: 'https://attacker.example', 'Content-Type': 'application/json' } }, '{}')).status, 403);
+        let throttled = false;
+        for (let i = 0; i < 12; i++) {
+            const result = await request({ path: '/api/status', headers: { Authorization: `Basic ${Buffer.from(`${ADMIN_USER}:wrong`).toString('base64')}`, 'X-Real-IP': `203.0.113.${i + 1}` } });
+            if (result.status === 429) { throttled = true; assert.ok(result.headers['retry-after']); break; }
+        }
+        assert.ok(throttled, 'Basic 暴力猜测必须受限，伪造 X-Real-IP 不能绕过');
         console.log('✓ 11. 单节点单 HY2、同号 TCP/UDP、复制备注、端口冲突、停用/删除联动及密码轮换通过');
 
         console.log('\n🎉 ALL E2E INTEGRATION TESTS PASSED!');

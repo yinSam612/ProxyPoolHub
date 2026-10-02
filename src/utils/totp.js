@@ -122,9 +122,13 @@ function generateTotp(secret, timestamp = Date.now(), stepSeconds = 30, digits =
  * @returns {boolean} 校验是否通过
  */
 function verifyTotp(token, secret, options = {}) {
+    return verifyTotpStep(token, secret, options) !== null;
+}
+
+function verifyTotpStep(token, secret, options = {}) {
     const cleanToken = String(token || '').trim();
     if (!/^\d{6}$/.test(cleanToken) || !secret) {
-        return false;
+        return null;
     }
 
     const window = Math.max(0, Number(options.window ?? 1));
@@ -136,11 +140,11 @@ function verifyTotp(token, secret, options = {}) {
         const checkTime = now + (i * stepSeconds * 1000);
         const expected = generateTotp(secret, checkTime, stepSeconds, digits);
         if (expected && crypto.timingSafeEqual(Buffer.from(cleanToken), Buffer.from(expected))) {
-            return true;
+            return Math.floor((now + i * stepSeconds * 1000) / 1000 / stepSeconds);
         }
     }
 
-    return false;
+    return null;
 }
 
 /**
@@ -163,5 +167,6 @@ module.exports = {
     generateSecret,
     generateTotp,
     verifyTotp,
+    verifyTotpStep,
     buildOtpauthUrl
 };

@@ -3,7 +3,7 @@
 const assert = require('assert');
 const ProxyManager = require('../src/core/proxy-manager');
 
-const manager = new ProxyManager({ listenAddress: '0.0.0.0' });
+const manager = new ProxyManager({ listenAddress: '0.0.0.0', proxyUsername: 'test', proxyPassword: 'test-only-secret' });
 try {
     const proxies = [
         { proxyId: 'node-a', tag: 'proxy-0', type: 'trojan', server: 'one.example.com', server_port: 443, password: 'one', listenPort: 40000 },

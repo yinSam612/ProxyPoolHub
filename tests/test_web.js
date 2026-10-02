@@ -16,15 +16,17 @@ async function run() {
             name: index ? `VPS-${index}` : 'vps-machine', protocol: index ? 'hysteria2' : 'direct',
             server: `198.51.100.${index + 1}`, upstreamPort: 20443, listenPort: 39999 + index,
             enabled: index !== 10, status: index === 10 ? 'disabled' : 'online', latencyMs: 27 + index,
-            exitIp: `198.51.100.${index + 1}`, location: 'United States / California / Los Angeles',
+            exitIp: `198.51.100.${index + 1}`, countryCode: 'US', location: 'United States / California / Los Angeles',
             lastCheckedAt: '2026-10-02T01:00:00Z', lastError: '',
             hy2: index < 2 ? { id: `relay-${index}`, status: 'enabled', link: `hysteria2://example@example.test:${39999 + index}/#${index ? `VPS-${index}` : 'vps-machine'}:198.51.100.${index + 1}-US` } : null
         }));
-        const settings = { proxyUsername: 'proxy+user', proxyPassword: 'P@$$:word#? "quoted"', publicHost: 'example.test', subscriptions: {}, authDisabled: true };
+        const settings = { proxyUsername: 'proxy+user', proxyPassword: 'P@$$:word#? "quoted"', publicHost: 'example.test', subscriptions: {}, authDisabled: true,
+            proxyAccess: { publicTcp: 'unverified', sources: '' } };
         const dockerEndpoint = (node, scheme) => `${scheme}://${encodeURIComponent(settings.proxyUsername)}:${encodeURIComponent(settings.proxyPassword)}@host:${node.listenPort}`;
         let core = 'running';
         let healthRunning = false;
         let slow = false;
+        let rejectReality = false;
         let active = 0;
         let maxActive = 0;
         const requests = [];
@@ -47,10 +49,12 @@ async function run() {
                     const node = nodes.find((candidate) => candidate.id === realityAction[1]);
                     if (request.method() === 'DELETE') { node.reality = null; data = { ok: true }; }
                     else {
+                        if (rejectReality) return route.fulfill({ status: 400, json: { error: 'Reality port unavailable' } });
                         const body = request.postDataJSON();
                         assert.strictEqual(typeof body.enabled, 'boolean');
-                        node.reality = { ...body, listenPort: 50000, status: body.enabled ? 'enabled' : 'disabled',
-                            link: `vless://test-uuid@${body.host}:50000?type=raw&security=reality&sni=${body.serverName}#${encodeURIComponent(node.name)}:198.51.100.1-US` };
+                        const reality = { ...node.reality, ...body };
+                        node.reality = { ...reality, listenPort: 50000, status: body.enabled ? 'enabled' : 'disabled',
+                            link: `vless://test-uuid@${reality.host}:50000?type=raw&security=reality&sni=${reality.serverName}#${encodeURIComponent(node.name)}:198.51.100.1-US` };
                         data = node.reality;
                     }
                 }
@@ -74,6 +78,11 @@ async function run() {
             } finally { active--; }
         });
         const page = await context.newPage();
+        const openNodePanel = async (id) => {
+            await page.locator(`#row-${id} .row-menu .menu-trigger`).click();
+            await page.locator(`#row-${id} [data-action="manage"]`).click();
+            await page.locator('#nodeSettingsDialog').waitFor({ state: 'visible' });
+        };
         const readClipboard = () => page.evaluate(async () => (await navigator.clipboard.readText()).replace(/\r\n/g, '\n'));
         const errors = [];
         page.on('pageerror', (error) => errors.push(error.message));
@@ -82,6 +91,8 @@ async function run() {
         await page.waitForSelector('#row-local-vps');
         assert.strictEqual(await page.locator('#endpoint').innerText(), 'example.test');
         await page.locator('#row-test-1 .row-select').check();
+        assert.ok(await page.locator('#row-test-1').evaluate((row) => row.classList.contains('is-selected')));
+        assert.ok(!await page.locator('#row-local-vps').evaluate((row) => row.classList.contains('is-selected')));
         await page.locator('#nodeFilter').fill('VPS-2');
         await page.locator('#selectAll').check();
         await page.locator('#nodeFilter').fill('');
@@ -100,32 +111,35 @@ async function run() {
         assert.ok(await page.locator('#row-test-10 .row-select').isChecked());
         await page.locator('#row-test-2 [data-action="test"]').click();
         await page.waitForFunction(() => document.querySelector('#row-test-2 .latency-val').textContent.includes('91'));
-        await page.locator('.toolbar .tool-menu').nth(1).locator('summary').click();
+        await page.locator('#copyMenu .menu-trigger').click();
         await page.locator('#copyHy2').click();
         assert.strictEqual(await readClipboard(), nodes[1].hy2.link);
-        await page.locator('#dockerMenu summary').click();
+        await page.locator('#dockerMenu .menu-trigger').click();
         await page.locator('#copyDockerCompose').click();
         const composeFragment = '    extra_hosts:\n      - "host:host-gateway"';
         assert.strictEqual(await readClipboard(), composeFragment);
-        assert.ok(await page.locator('#dockerMenu').evaluate((element) => element.open), 'copying Compose should leave its example visible');
+        assert.ok(await page.locator('#dockerBubble').isVisible(), 'copying Compose should leave its example visible');
         for (const [button, scheme] of [['copyDockerHttp', 'http'], ['copyDockerSocks', 'socks5']]) {
             await page.locator(`#${button}`).click();
             assert.strictEqual(await readClipboard(), [nodes[1], nodes[2]].map((node) => dockerEndpoint(node, scheme)).join('\n'));
         }
         await page.keyboard.press('Escape');
-        await page.locator('#row-test-2 .row-menu summary').click();
-        await page.locator('#row-test-2 [data-action="copy-docker-http"]').click();
+        await page.locator('#copyScope').selectOption('docker');
+        await page.locator('#row-test-2 [data-action="copy-http"]').click();
         assert.strictEqual(await readClipboard(), dockerEndpoint(nodes[2], 'http'));
-        await page.locator('#row-local-vps .row-menu summary').click();
         await page.evaluate(() => Object.defineProperty(window, 'isSecureContext', { configurable: true, value: false }));
-        await page.locator('#row-local-vps [data-action="copy-docker-socks"]').click();
+        await page.locator('#row-local-vps [data-action="copy-socks"]').click();
         assert.strictEqual(await readClipboard(), dockerEndpoint(nodes[0], 'socks5'), 'Docker copying must work on HTTP panels using the clipboard fallback');
         await page.evaluate(() => { delete window.isSecureContext; });
-        await page.locator('#row-test-10 .row-menu summary').click();
-        assert.ok(await page.locator('#row-test-10 [data-action="copy-docker-http"]').isDisabled());
-        assert.ok(await page.locator('#row-test-10 [data-action="copy-docker-socks"]').isDisabled());
-        await page.keyboard.press('Escape');
-        await page.locator('#row-local-vps [data-action="reality"]').first().click();
+        assert.ok(await page.locator('#row-test-10 [data-action="copy-http"]').isDisabled());
+        assert.ok(await page.locator('#row-test-10 [data-action="copy-socks"]').isDisabled());
+        await page.locator('#copyScope').selectOption('local');
+        await openNodePanel('local-vps');
+        await page.locator('#nodeSettingsDialog [data-action="reality"]').focus();
+        await page.evaluate(() => refresh(false));
+        assert.ok(await page.locator('#nodeSettingsDialog [data-action="reality"]').evaluate((button) => button === document.activeElement),
+            'passive sync must preserve node settings focus');
+        await page.locator('#nodeSettingsDialog [data-action="reality"]').click();
         assert.strictEqual(await page.locator('#realityForm [name="host"]').inputValue(), 'example.test');
         assert.strictEqual(await page.locator('#realityForm [name="serverName"]').inputValue(), 'www.apple.com');
         assert.ok(await page.locator('#copyRealityLink').isDisabled());
@@ -141,6 +155,34 @@ async function run() {
         await page.locator('#realityForm [type="submit"]').click();
         await page.waitForFunction(() => document.querySelector('#realityDialog .dialog-feedback').textContent.includes('已启用'));
         await page.locator('#realityDialog [data-close]').click();
+        await openNodePanel('local-vps');
+        const realitySwitch = page.locator('#nodeSettingsDialog [data-action="toggle-reality"]');
+        assert.strictEqual(await realitySwitch.count(), 1, 'configured VLESS needs a direct switch alongside HY2');
+        assert.strictEqual(await realitySwitch.getAttribute('aria-checked'), 'true');
+        const originalReality = { ...nodes[0].reality };
+        const originalHy2 = { ...nodes[0].hy2 };
+        rejectReality = true;
+        await realitySwitch.click();
+        await page.waitForFunction(() => document.querySelector('#nodeSettingsDialog .dialog-feedback')?.textContent.includes('port unavailable'));
+        assert.ok(!await realitySwitch.isDisabled(), 'failed toggles must restore the switch');
+        assert.strictEqual(await realitySwitch.getAttribute('aria-checked'), 'true', 'failed toggles must retain the saved state');
+        assert.deepStrictEqual(nodes[0].reality, originalReality);
+        rejectReality = false;
+        slow = true;
+        const writesBefore = requests.filter(entry => entry.pathname.endsWith('/reality') && entry.method === 'PUT').length;
+        await realitySwitch.click();
+        assert.ok(await realitySwitch.isDisabled(), 'pending toggles must prevent duplicate requests');
+        await realitySwitch.evaluate(button => button.click());
+        await page.waitForFunction(() => document.querySelector('#nodeSettingsDialog [data-action="toggle-reality"]').getAttribute('aria-checked') === 'false');
+        slow = false;
+        assert.strictEqual(requests.filter(entry => entry.pathname.endsWith('/reality') && entry.method === 'PUT').length, writesBefore + 1);
+        assert.ok(await page.locator('#row-local-vps [data-action="copy-reality"]').isDisabled());
+        assert.strictEqual(nodes[0].reality.link, originalReality.link, 'disabling must preserve the public link');
+        assert.deepStrictEqual(nodes[0].hy2, originalHy2, 'disabling VLESS must not change HY2');
+        await realitySwitch.press('Enter');
+        await page.waitForFunction(() => document.querySelector('#nodeSettingsDialog [data-action="toggle-reality"]').getAttribute('aria-checked') === 'true');
+        assert.deepStrictEqual(nodes[0].reality, originalReality, 'reenabling must preserve Reality configuration');
+        await page.locator('#nodeSettingsDialog [data-close]').click();
         await page.locator('#row-local-vps [data-action="copy-reality"]').click();
         assert.strictEqual(await readClipboard(), nodes[0].reality.link);
         assert.ok((await readClipboard()).includes('#vps-machine:'));
@@ -150,7 +192,8 @@ async function run() {
                 link: `vless://example@example.test:${50000 + index}?type=raw&security=reality#VPS-${index}` };
         }
         await page.evaluate(() => refresh(false));
-        await page.locator('#copyMenu summary').click();
+        await page.locator('#copyMenu .menu-trigger').click();
+        await page.locator('#selectedCopyMenu').waitFor({ state: 'visible' });
         assert.strictEqual(await page.locator('#copyVless').innerText(), 'VLESS Reality');
         assert.strictEqual(await page.locator('#copyVless').evaluate((el) => el.previousElementSibling.id), 'copyHy2');
         await page.locator('#copyVless').click();
@@ -162,21 +205,44 @@ async function run() {
         });
         assert.ok(noVless.includes('已启用 VLESS Reality'));
         const proxyEndpoint = (node, scheme, host) => dockerEndpoint(node, scheme).replace('@host:', `@${host}:`);
-        for (const [button, scheme, host] of [['copyInternalHttp', 'http', '127.0.0.1'], ['copyInternalSocks', 'socks5', '127.0.0.1'], ['copyHttp', 'http', 'example.test'], ['copySocks', 'socks5', 'example.test']]) {
-            await page.locator('#copyMenu summary').click();
+        for (const [button, scheme, host, scope] of [['copyHttp', 'http', '127.0.0.1', 'local'], ['copySocks', 'socks5', '127.0.0.1', 'local'], ['copyHttp', 'http', 'host', 'docker'], ['copySocks', 'socks5', 'host', 'docker'], ['copyHttp', 'http', 'example.test', 'public'], ['copySocks', 'socks5', 'example.test', 'public']]) {
+            await page.locator('#copyScope').selectOption(scope);
+            await page.locator('#copyMenu .menu-trigger').click();
             await page.locator(`#${button}`).click();
             assert.strictEqual(await readClipboard(), [nodes[0], nodes[1], nodes[2]].map((node) => proxyEndpoint(node, scheme, host)).join('\n'));
         }
+        await page.locator('#copyScope').selectOption('local');
         for (const [action, scheme] of [['copy-http', 'http'], ['copy-socks', 'socks5']]) {
             await page.locator(`#row-local-vps [data-action="${action}"]`).click();
             assert.strictEqual(await readClipboard(), proxyEndpoint(nodes[0], scheme, '127.0.0.1'), 'default HTTP/SOCKS5 copies are for the VPS itself');
         }
-        for (const [action, scheme] of [['copy-public-http', 'http'], ['copy-public-socks', 'socks5']]) {
-            await page.locator('#row-local-vps .row-menu summary').click();
+        await page.locator('#copyScope').selectOption('public');
+        for (const [action, scheme] of [['copy-http', 'http'], ['copy-socks', 'socks5']]) {
             await page.locator(`#row-local-vps [data-action="${action}"]`).click();
             assert.strictEqual(await readClipboard(), proxyEndpoint(nodes[0], scheme, 'example.test'));
         }
-        await page.locator('.settings-menu summary').click();
+        settings.proxyAccess = { publicTcp: 'blocked', sources: '' };
+        await page.evaluate(() => refresh());
+        assert.ok(await page.locator('#copyScope [value="public"]').isDisabled());
+        assert.strictEqual(await page.locator('#copyScope').inputValue(), 'local');
+        assert.strictEqual(await page.locator('#publicProxyStatus').innerText(), '公网未开放');
+        const blockedCopy = await page.evaluate(async () => {
+            try { await copyItems([items[0]], 'http'); return ''; } catch (error) { return error.message; }
+        });
+        assert.ok(blockedCopy.includes('未开放'), 'blocked public addresses cannot be presented as working proxies');
+        settings.proxyAccess = { publicTcp: 'restricted', sources: '203.0.113.8/32' };
+        await page.evaluate(() => refresh());
+        assert.ok(!await page.locator('#copyScope [value="public"]').isDisabled());
+        assert.strictEqual(await page.locator('#publicProxyStatus').getAttribute('title'), '203.0.113.8/32');
+        settings.proxyAccess = { publicTcp: 'blocked', sources: '' };
+        await page.evaluate(() => refresh());
+        await page.locator('#copyScope').selectOption('docker');
+        await page.locator('#row-local-vps [data-action="copy-hy2"]').click();
+        assert.strictEqual(await readClipboard(), nodes[0].hy2.link, 'HY2 remains public in Docker mode');
+        await page.locator('#row-local-vps [data-action="copy-reality"]').click();
+        assert.strictEqual(await readClipboard(), nodes[0].reality.link, 'VLESS remains public in Docker mode');
+        await page.locator('#copyScope').selectOption('local');
+        await page.locator('.settings-menu .menu-trigger').click();
         await page.locator('#openSettingsDialog').click();
         await page.locator('#settingsForm [name="publicHost"]').fill('unsaved.example.test');
         const settingsBeforePolling = requests.filter((request) => request.pathname === '/api/settings').length;
@@ -219,6 +285,28 @@ async function run() {
         assert.ok((await page.locator('#row-local-vps .reality-port-chip').innerText()).includes('停止'));
         core = 'running';
         await page.evaluate(() => refresh(false));
+        for (const [width, height] of [[1385, 844], [1024, 844], [390, 844], [320, 844], [390, 440]]) {
+            await page.setViewportSize({ width, height });
+            for (const block of ['start', 'end']) {
+                const trigger = page.locator('#row-test-3 .row-menu .menu-trigger');
+                await trigger.evaluate((element, block) => element.scrollIntoView({ block, behavior: 'instant' }), block);
+                await trigger.click();
+                await page.locator('#node-menu-test-3').waitFor({ state: 'visible' });
+                const menu = await page.locator('#node-menu-test-3').boundingBox();
+                assert.ok(menu.x >= 0 && menu.y >= 0 && menu.x + menu.width <= width && menu.y + menu.height <= height,
+                    `scrolled menu must fit ${width}x${height}, ${block}: ${JSON.stringify(menu)}`);
+                assert.strictEqual(await page.locator('#node-menu-test-3 .node-menu-name').innerText(), 'VPS-3');
+                assert.strictEqual(await page.locator('.menu-items:popover-open').count(), 1);
+                nodes[3].lastCheckedAt = '2026-10-02T03:00:00Z';
+                await page.evaluate(() => refresh(false));
+                assert.ok(await page.locator('#node-menu-test-3').isVisible(), 'passive sync cannot dismiss an active menu');
+                if (process.env.PPH_WEB_SCREENSHOT_DIR && block === 'start') await page.screenshot({ path: path.join(process.env.PPH_WEB_SCREENSHOT_DIR, `scrolled-menu-${width}-${height}.png`) });
+                await page.keyboard.press('Escape');
+                assert.ok(!await page.locator('#node-menu-test-3').isVisible());
+            }
+        }
+        await page.setViewportSize({ width: 1385, height: 844 });
+        await page.evaluate(() => window.scrollTo({ top: 0, behavior: 'instant' }));
         await page.locator('#row-local-vps .row-select').check();
         await page.locator('#batchDelete').click();
         assert.ok(await page.locator('#confirmDialog').isVisible());
@@ -232,18 +320,23 @@ async function run() {
             assert.ok(dimensions.scroll <= dimensions.width, `horizontal overflow at ${width}px (${dimensions.scroll}px): ${JSON.stringify(await page.evaluate(() => Array.from(document.querySelectorAll('body *')).filter((element) => element.getBoundingClientRect().right > innerWidth + 1).map((element) => ({ cls: element.className, id: element.id, right: element.getBoundingClientRect().right }))))}`);
             const row = await page.locator('.node-row').first().boundingBox();
             if (width <= 900) assert.ok(row.y + row.height < 844, 'first node and actions must fit in first viewport');
-            await page.locator('.node-row .row-menu summary').first().click();
-            const menu = await page.locator('.row-menu[open] .menu-items').boundingBox();
-            assert.ok(menu.x >= 0 && menu.x + menu.width <= width, 'row menu must remain on screen');
+            await page.locator('.node-row .row-menu .menu-trigger').first().click();
+            await page.locator('.row-menu .menu-items:popover-open').waitFor({ state: 'visible' });
+            const menu = await page.locator('.row-menu .menu-items:popover-open').boundingBox();
+            assert.ok(menu.x >= 0 && menu.x + menu.width <= width && menu.y >= 0 && menu.y + menu.height <= 844, 'row menu must remain fully on screen');
+            assert.ok(await page.locator('.row-menu .menu-items:popover-open button').count() <= 3);
+            if (width > 900) assert.ok(row.height <= 80, `desktop rows must stay compact at ${width}px: ${row.height}; ${JSON.stringify(await page.locator('.node-row').first().evaluate(row => [...row.querySelectorAll('.col-actions, .copy-actions, .node-actions')].map(e => ({ class: e.className, width: e.getBoundingClientRect().width, height: e.getBoundingClientRect().height }))))}`);
             await page.keyboard.press('Escape');
-            await page.locator('#copyMenu summary').click();
+            await page.locator('#copyMenu .menu-trigger').click();
+            await page.locator('#selectedCopyMenu').waitFor({ state: 'visible' });
             const copyMenu = await page.locator('#copyMenu .menu-items').boundingBox();
             assert.ok(copyMenu.x >= 0 && copyMenu.x + copyMenu.width <= width && copyMenu.y >= 0 && copyMenu.y + copyMenu.height <= 844, `public/internal copy menu must fit at ${width}px`);
             if (process.env.PPH_WEB_SCREENSHOT_DIR && [1385, 390, 320].includes(width)) {
                 await page.screenshot({ path: path.join(process.env.PPH_WEB_SCREENSHOT_DIR, `copy-menu-${width}.png`) });
             }
             await page.keyboard.press('Escape');
-            await page.locator('#dockerMenu summary').click();
+            await page.locator('#dockerMenu .menu-trigger').click();
+            await page.locator('#dockerBubble').waitFor({ state: 'visible' });
             const bubble = await page.locator('.docker-bubble').boundingBox();
             assert.ok(bubble.x >= 0 && bubble.x + bubble.width <= width && bubble.y + bubble.height <= 844, `Docker bubble must fit at ${width}px`);
             await page.locator('#copyDockerCompose').click();
@@ -251,11 +344,15 @@ async function run() {
             const hitbox = await page.locator('#copyDockerCompose').boundingBox();
             assert.ok(hitbox.height >= 38);
             await page.keyboard.press('Escape');
+            await page.clock.fastForward(4000);
             if (process.env.PPH_WEB_SCREENSHOT_DIR && [1385, 390, 320].includes(width)) {
                 await page.screenshot({ path: path.join(process.env.PPH_WEB_SCREENSHOT_DIR, `nodes-${width}.png`) });
             }
-            await page.locator('#row-local-vps .row-menu summary').click();
-            await page.locator('#row-local-vps .row-menu [data-action="reality"]').click();
+            await openNodePanel('local-vps');
+            const panel = await page.locator('#nodeSettingsDialog').boundingBox();
+            assert.ok(panel.x >= 0 && panel.x + panel.width <= width && panel.y >= 0 && panel.y + panel.height <= 844, 'node settings must fit the viewport');
+            if (process.env.PPH_WEB_SCREENSHOT_DIR && [1385, 390, 320].includes(width)) await page.screenshot({ path: path.join(process.env.PPH_WEB_SCREENSHOT_DIR, `node-settings-${width}.png`) });
+            await page.locator('#nodeSettingsDialog [data-action="reality"]').click();
             const modal = await page.locator('#realityDialog').boundingBox();
             assert.ok(modal.x >= 0 && modal.x + modal.width <= width && modal.y >= 0 && modal.y + modal.height <= 844, `Reality dialog must fit at ${width}px`);
             if (process.env.PPH_WEB_SCREENSHOT_DIR && [1385, 390, 320].includes(width)) {
@@ -264,12 +361,12 @@ async function run() {
             }
             await page.locator('#realityDialog [data-close]').click();
         }
-        await page.locator('#row-local-vps .row-menu summary').click();
-        await page.locator('#row-local-vps .row-menu [data-action="reality"]').click();
+        await openNodePanel('local-vps');
+        await page.locator('#nodeSettingsDialog [data-action="reality"]').click();
         await page.locator('#removeReality').click();
         await page.locator('#confirmOkBtn').click();
         await page.waitForFunction(() => !document.querySelector('#realityDialog').open);
-        assert.ok(await page.locator('#row-local-vps [data-action="reality"]').first().isVisible());
+        assert.ok(await page.locator('#row-local-vps [data-action="copy-reality"]').isDisabled());
         await page.setViewportSize({ width: 1385, height: 946 });
         await page.goto('http://127.0.0.1:3188/logs');
         assert.strictEqual(await page.locator('.logs-table-wrap').evaluate((element) => getComputedStyle(element).maxHeight), '526px');

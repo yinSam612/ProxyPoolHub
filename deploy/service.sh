@@ -29,6 +29,10 @@ ExecStart="${node_path}" "${app_dir}/server.js"
 Restart=always
 RestartSec=5
 UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ProtectHome=read-only
 LimitNOFILE=65535
 
 [Install]

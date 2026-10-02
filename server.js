@@ -6,10 +6,14 @@ const http = require('http');
 const net = require('net');
 const os = require('os');
 const crypto = require('crypto');
+const { promisify } = require('util');
 const { URL } = require('url');
 const ProxyManager = require('./src/core/proxy-manager');
 const totp = require('./src/utils/totp');
 const { generateQrSvg } = require('./src/utils/qrcode');
+const { ipAllowlist, clientIp, AuthLimiter } = require('./src/utils/security');
+const { syncFirewall } = require('./src/utils/firewall');
+const scrypt = promisify(crypto.scrypt);
 
 const ROOT = __dirname;
 
@@ -22,12 +26,12 @@ function ensureEnvFile(envFile, exampleFile) {
     if (!fs.existsSync(envFile) && fs.existsSync(exampleFile)) {
         try {
             const randomAdminPass = crypto.randomBytes(16).toString('hex') + 'aA1!';
-            const randomProxyPass = crypto.randomBytes(8).toString('hex');
+            const randomProxyPass = crypto.randomBytes(24).toString('base64url') + 'aA1!';
             let template = fs.readFileSync(exampleFile, 'utf8');
             template = template
                 .replace(/ADMIN_PASSWORD=change-this-admin-password/, `ADMIN_PASSWORD=${randomAdminPass}`)
                 .replace(/PROXY_PASSWORD=change-this-proxy-password/, `PROXY_PASSWORD=${randomProxyPass}`);
-            fs.writeFileSync(envFile, template, 'utf8');
+            fs.writeFileSync(envFile, template, { encoding: 'utf8', mode: 0o600 });
             console.log('[proxy] 首次运行检测到未配置 .env，已自动生成包含随机强密码的配置文件 (.env)');
         } catch (error) {
             // 忽略创建失败，继续向下加载
@@ -76,13 +80,15 @@ const ADMIN_USER = String(process.env.ADMIN_USER || 'admin');
 const ADMIN_PASSWORD = String(process.env.ADMIN_PASSWORD || crypto.randomBytes(16).toString('hex') + 'aA1!');
 const SESSION_COOKIE = 'proxy_admin_session';
 const SESSION_TTL_MS = 12 * 60 * 60 * 1000;
-const LOGIN_WINDOW_MS = 10 * 60 * 1000;
-const LOGIN_MAX_ATTEMPTS = 10;
 const RECOVERY_FAILURES = Math.max(1, Math.floor(Number(process.env.PROXY_RECOVERY_FAILURES) || 3));
 const RECOVERY_MAX_DELAY_MS = Math.max(30000, Number(process.env.PROXY_RECOVERY_MAX_DELAY_MS) || 300000);
 const INTERNAL_PROXY_HOST = '127.0.0.1';
 const sessions = new Map();
-const loginAttempts = new Map();
+const pendingTotp = new Map();
+const authLimiter = new AuthLimiter();
+const trustedProxy = ipAllowlist(process.env.TRUSTED_PROXY_CIDRS || '');
+const webAllowed = ipAllowlist(`${process.env.WEB_ALLOWED_CIDRS || '127.0.0.1/32,::1/128'},${process.env.TRUSTED_PROXY_CIDRS || ''}`);
+let authChecks = 0;
 let store = loadStore();
 let proxyUser = String(store.settings?.proxyUsername || process.env.PROXY_USERNAME || '');
 let proxyPassword = String(store.settings?.proxyPassword || process.env.PROXY_PASSWORD || '');
@@ -154,13 +160,12 @@ function subscriptionUrls(request) {
     const port = Number(process.env.WEB_PORT || 3100);
     let host = String(store.settings?.publicHost || process.env.PUBLIC_HOST || '').trim();
     if (!host || host === 'proxy.example.com') {
-        const headerHost = request ? String(request.headers['x-forwarded-host'] || request.headers.host || '').split(':')[0] : '';
+        const headerHost = request ? String(request.headers.host || '').split(':')[0] : '';
         host = headerHost || '127.0.0.1';
     }
-    return {
-        http: `http://${host}:${port}/subscription/http/${token}`,
-        socks5: `http://${host}:${port}/subscription/socks5/${token}`
-    };
+    const secure = request && (request.socket.encrypted || (trustedProxy(request.socket.remoteAddress) && request.headers['x-forwarded-proto'] === 'https'));
+    const origin = secure ? `https://${host}` : `http://${host}:${port}`;
+    return { http: `${origin}/subscription/http/${token}`, socks5: `${origin}/subscription/socks5/${token}` };
 }
 
 function clone(value) {
@@ -179,18 +184,18 @@ function authMatches(value, expected) {
     return left.length === right.length && crypto.timingSafeEqual(left, right);
 }
 
-function adminPasswordMatches(value) {
+async function adminPasswordMatches(value) {
     const stored = String(store.settings?.adminPasswordHash || '');
     if (!stored) return authMatches(value, ADMIN_PASSWORD);
     if (String(value).length > 256) return false;
     const match = /^scrypt:([a-f0-9]{32}):([a-f0-9]{128})$/.exec(stored);
     return Boolean(match) && crypto.timingSafeEqual(
-        crypto.scryptSync(String(value), Buffer.from(match[1], 'hex'), 64),
+        await scrypt(String(value), Buffer.from(match[1], 'hex'), 64),
         Buffer.from(match[2], 'hex')
     );
 }
 
-function basicAuthorized(request) {
+async function basicAuthorized(request, response) {
     const header = String(request.headers.authorization || '');
     if (!header.startsWith('Basic ')) {
         return false;
@@ -202,9 +207,10 @@ function basicAuthorized(request) {
         return false;
     }
     const separator = decoded.indexOf(':');
-    return separator >= 0
-        && authMatches(decoded.slice(0, separator), ADMIN_USER)
-        && adminPasswordMatches(decoded.slice(separator + 1));
+    if (separator < 0 || store.settings.totpEnabled) return false;
+    const result = await authenticate(request, decoded.slice(0, separator), decoded.slice(separator + 1));
+    if (result.status === 429) response.setHeader('Retry-After', result.retryAfter);
+    return result;
 }
 
 function cookieValue(request, name) {
@@ -224,6 +230,7 @@ function sessionAuthorized(request) {
     }
     if (expiresAt <= Date.now()) {
         sessions.delete(token);
+        pendingTotp.delete(token);
         return false;
     }
     return true;
@@ -235,44 +242,56 @@ function sessionAuthorized(request) {
  * @returns {boolean}
  */
 function isAuthDisabled() {
+    if (store.settings.totpEnabled) return false;
+    if (!['127.0.0.1', '::1', 'localhost'].includes(process.env.WEB_HOST || '127.0.0.1')) return false;
     if (process.env.REQUIRE_AUTH === 'true') return false;
     if (process.env.DISABLE_AUTH === 'true') return true;
     return process.platform === 'win32';
 }
 
-function authorized(request, url) {
+async function authorized(request, response, url) {
     if (isAuthDisabled()) {
         return true;
     }
-    return sessionAuthorized(request)
-        || (url.pathname.startsWith('/api/') && basicAuthorized(request));
+    if (sessionAuthorized(request)) return true;
+    return url.pathname.startsWith('/api/') && await basicAuthorized(request, response);
 }
 
 function sessionCookie(request, token, maxAge) {
-    const forwardedProto = String(request.headers['x-forwarded-proto'] || '').split(',')[0].trim();
+    const forwardedProto = trustedProxy(request.socket.remoteAddress) ? String(request.headers['x-forwarded-proto'] || '').split(',')[0].trim() : '';
     const secure = request.socket.encrypted || forwardedProto === 'https';
     return `${SESSION_COOKIE}=${token}; Path=/; HttpOnly; SameSite=Strict; Max-Age=${maxAge}${secure ? '; Secure' : ''}`;
 }
 
-function loginKey(request) {
-    return String(request.headers['x-real-ip'] || request.socket.remoteAddress || 'unknown');
+async function authenticate(request, username, password, code = '', consumeCode = false) {
+    const ip = clientIp(request, trustedProxy);
+    const retryAfter = authLimiter.begin(ip);
+    if (retryAfter || authChecks >= 2) return { status: 429, retryAfter: retryAfter || 1 };
+    authChecks++;
+    try {
+        const step = store.settings.totpEnabled ? totp.verifyTotpStep(code, store.settings.totpSecret) : null;
+        const valid = authMatches(username, ADMIN_USER) && await adminPasswordMatches(password)
+            && (!store.settings.totpEnabled || (step !== null && (!consumeCode || step > (store.settings.lastTotpCounter ?? -1))));
+        if (!valid) {
+            authLimiter.fail();
+            console.warn(`[security] authentication failed from ${ip}`);
+            return { status: 401 };
+        }
+        if (consumeCode && store.settings.totpEnabled) {
+            store.settings.lastTotpCounter = step;
+            saveStore();
+        }
+        authLimiter.succeed(ip);
+        return { status: 200 };
+    } finally { authChecks--; }
 }
 
-function loginAllowed(request) {
-    const attempt = loginAttempts.get(loginKey(request));
-    if (!attempt || Date.now() - attempt.startedAt >= LOGIN_WINDOW_MS) {
-        return true;
-    }
-    return attempt.count < LOGIN_MAX_ATTEMPTS;
-}
-
-function recordLoginFailure(request) {
-    const key = loginKey(request);
-    const now = Date.now();
-    const attempt = loginAttempts.get(key);
-    loginAttempts.set(key, !attempt || now - attempt.startedAt >= LOGIN_WINDOW_MS
-        ? { count: 1, startedAt: now }
-        : { ...attempt, count: attempt.count + 1 });
+async function reauthenticate(request, response, body) {
+    const result = await authenticate(request, ADMIN_USER, String(body.currentPassword || ''), String(body.totpCode || ''));
+    if (result.status === 200) return true;
+    if (result.retryAfter) response.setHeader('Retry-After', result.retryAfter);
+    sendError(response, result.status === 429 ? 429 : 403, result.status === 429 ? '验证过于频繁，请稍后再试' : '当前密码或动态验证码错误');
+    return false;
 }
 
 function sendJson(response, status, body) {
@@ -289,13 +308,13 @@ function sendError(response, status, message) {
     sendJson(response, status, { error: String(message || 'request failed') });
 }
 
-function readBody(request) {
+function readBody(request, maxBytes = 128 * 1024) {
     return new Promise((resolve, reject) => {
         const chunks = [];
         let size = 0;
         request.on('data', (chunk) => {
             size += chunk.length;
-            if (size > 128 * 1024) {
+            if (size > maxBytes) {
                 reject(new Error('request body too large'));
                 request.destroy();
                 return;
@@ -318,7 +337,7 @@ async function parseBody(request) {
 }
 
 async function parseForm(request) {
-    return new URLSearchParams(await readBody(request));
+    return new URLSearchParams(await readBody(request, 8192));
 }
 
 function publicProxy(item) {
@@ -338,6 +357,7 @@ function publicProxy(item) {
         status: !item.enabled ? 'disabled' : !manager.process || manager.process.exitCode !== null ? 'stopped' : (item.status || 'unknown'),
         latencyMs: item.latencyMs || 0,
         exitIp: item.exitIp || '',
+        countryCode: item.countryCode || '',
         location: item.location || '',
         lastCheckedAt: item.lastCheckedAt || '',
         lastError: item.lastError || '',
@@ -520,6 +540,10 @@ function publicSettings(request) {
     if (configuredHost === 'proxy.example.com') {
         configuredHost = '';
     }
+    const managedFirewall = process.env.MANAGE_FIREWALL === 'true';
+    const externalSources = managedFirewall ? String(process.env.PROXY_EXTERNAL_CIDRS || '').trim() : '';
+    const listenAddress = process.env.PROXY_LISTEN_ADDRESS || '0.0.0.0';
+    const localOnly = listenAddress === 'localhost' || ipAllowlist('127.0.0.0/8,::1/128')(listenAddress);
     return {
         adminUser: ADMIN_USER || 'admin',
         proxyUsername: proxyUser,
@@ -528,7 +552,11 @@ function publicSettings(request) {
         subscriptions: subscriptionUrls(request),
         totpEnabled: Boolean(store.settings?.totpEnabled),
         totpConfigured: Boolean(store.settings?.totpSecret),
-        authDisabled: isAuthDisabled()
+        authDisabled: isAuthDisabled(),
+        proxyAccess: {
+            publicTcp: localOnly || (managedFirewall && !externalSources) ? 'blocked' : managedFirewall ? 'restricted' : 'unverified',
+            sources: externalSources
+        }
     };
 }
 
@@ -651,6 +679,10 @@ async function rebuild(options = {}) {
     const active = store.proxies.filter((item) => item.enabled);
     const relays = store.relays.filter(relayIsActive);
     const tls = relayTlsSettings();
+    syncFirewall({ inbounds: [
+        ...relays.map((item) => ({ type: 'hysteria2', listen_port: item.listenPort })),
+        ...active.filter((item) => item.reality?.enabled).map((item) => ({ type: 'vless', listen_port: item.reality.listenPort }))
+    ] });
     if (relays.length) validateRelayTls(tls);
     if (relays.length && tls.mode === 'auto' && !(activeAcmeHost && manager.process?.exitCode === null)) {
         await assertAcmePortAvailable();
@@ -769,6 +801,11 @@ async function updateSettings(settings) {
     const publicHost = String(settings.publicHost || '').trim();
     if (!username || !password) {
         throw new Error('proxy username and password are required');
+    }
+    if (Buffer.byteLength(username) > 255 || username.includes(':')) throw new Error('invalid proxy username');
+    if (password !== proxyPassword && (password.length < 16 || Buffer.byteLength(password) > 255 || !/[a-z]/.test(password)
+        || !/[A-Z]/.test(password) || !/[0-9]/.test(password) || !/[^a-zA-Z0-9\s]/.test(password))) {
+        throw new Error('invalid proxy password: 新密码至少 16 位，须含大小写字母、数字和符号，且不超过 255 字节');
     }
     store.settings = { ...store.settings, proxyUsername: username, proxyPassword: password, publicHost };
     proxyUser = username;
@@ -928,21 +965,18 @@ function triggerAsyncNodeCheck(targetItems) {
 async function handleApi(request, response, url) {
     if (request.method === 'POST' && url.pathname === '/api/admin/password') {
         const body = await parseBody(request);
-        const currentPassword = String(body.currentPassword || '');
         const newPassword = String(body.newPassword || '');
-        await exclusive(() => {
-            if (!adminPasswordMatches(currentPassword)) {
-                return sendError(response, 403, '当前管理员密码错误');
-            }
+        if (!await reauthenticate(request, response, body)) return;
+        await exclusive(async () => {
             if (newPassword.length < 12 || newPassword.length > 256 || !/[a-z]/.test(newPassword) || !/[A-Z]/.test(newPassword)
                 || !/[0-9]/.test(newPassword) || !/[^a-zA-Z0-9\s]/.test(newPassword)) {
                 return sendError(response, 400, '新密码至少 12 位，须包含大小写字母、数字和符号');
             }
-            if (adminPasswordMatches(newPassword)) {
+            if (await adminPasswordMatches(newPassword)) {
                 return sendError(response, 400, '新密码不能与当前密码相同');
             }
             const salt = crypto.randomBytes(16);
-            const hash = crypto.scryptSync(newPassword, salt, 64);
+            const hash = await scrypt(newPassword, salt, 64);
             store.settings = { ...store.settings, adminPasswordHash: `scrypt:${salt.toString('hex')}:${hash.toString('hex')}` };
             saveStore();
             sessions.clear();
@@ -950,13 +984,20 @@ async function handleApi(request, response, url) {
         });
         return;
     }
-    const realityMatch = url.pathname.match(/^\/api\/proxies\/([^/]+)\/reality$/);
+    const realityMatch = url.pathname.match(/^\/api\/proxies\/([^/]+)\/reality(?:\/(rotate))?$/);
     if (realityMatch) {
-        const body = request.method === 'PUT' ? await parseBody(request) : {};
-        if (!['PUT', 'DELETE'].includes(request.method)) return sendError(response, 405, 'method not allowed');
+        const rotating = request.method === 'POST' && realityMatch[2] === 'rotate';
+        const body = request.method === 'PUT' || rotating ? await parseBody(request) : {};
+        if (realityMatch[2] ? !rotating : !['PUT', 'DELETE'].includes(request.method)) return sendError(response, 405, 'method not allowed');
+        if (rotating && !await reauthenticate(request, response, body)) return;
         await exclusive(async () => {
             const proxy = findProxy(realityMatch[1]);
             if (!proxy) return sendError(response, 404, 'proxy not found');
+            if (rotating) {
+                if (!proxy.reality) return sendError(response, 404, 'Reality not configured');
+                await commit((current) => Object.assign(current.proxies.find((item) => item.id === proxy.id).reality, realityCredentials()));
+                return sendJson(response, 200, publicReality(findProxy(proxy.id)));
+            }
             if (request.method === 'DELETE') {
                 await commit((current) => { delete current.proxies.find((item) => item.id === proxy.id).reality; });
                 return sendJson(response, 200, { ok: true });
@@ -1035,7 +1076,7 @@ async function handleApi(request, response, url) {
         });
         return;
     }
-    const relayMatch = url.pathname.match(/^\/api\/relays\/([a-f0-9]{24})(?:\/(enable|disable))?$/);
+    const relayMatch = url.pathname.match(/^\/api\/relays\/([a-f0-9]{24})(?:\/(enable|disable|rotate))?$/);
     if (relayMatch) {
         const relay = store.relays.find((item) => item.id === relayMatch[1]);
         if (!relay) return sendError(response, 404, 'HY2 relay not found');
@@ -1047,6 +1088,14 @@ async function handleApi(request, response, url) {
             return;
         }
         if (request.method === 'POST' && relayMatch[2]) {
+            if (relayMatch[2] === 'rotate') {
+                if (!await reauthenticate(request, response, await parseBody(request))) return;
+                await exclusive(async () => {
+                    await commit((current) => { current.relays.find((item) => item.id === relay.id).password = crypto.randomBytes(24).toString('base64url'); });
+                    sendJson(response, 200, publicRelay(relay));
+                });
+                return;
+            }
             await exclusive(async () => {
                 if (relayMatch[2] === 'enable') {
                     const proxy = requireRelayProxy(relay.proxyId);
@@ -1079,6 +1128,7 @@ async function handleApi(request, response, url) {
     }
     if (request.method === 'PUT' && url.pathname === '/api/settings') {
         const body = await parseBody(request);
+        if ((body.proxyUsername !== proxyUser || body.proxyPassword !== proxyPassword) && !await reauthenticate(request, response, body)) return;
         await exclusive(async () => {
             await updateSettings(body);
             sendJson(response, 200, publicSettings(request));
@@ -1086,7 +1136,12 @@ async function handleApi(request, response, url) {
         return;
     }
     if (request.method === 'GET' && url.pathname === '/api/totp/setup') {
-        const secret = store.settings?.totpSecret || totp.generateSecret();
+        if (store.settings.totpEnabled) return sendJson(response, 200, { enabled: true });
+        const key = cookieValue(request, SESSION_COOKIE);
+        if (!sessionAuthorized(request)) return sendError(response, 403, 'session required');
+        const pending = pendingTotp.get(key);
+        const secret = pending && pending.expires > Date.now() ? pending.secret : totp.generateSecret();
+        pendingTotp.set(key, { secret, expires: Date.now() + 600000 });
         const otpauthUrl = totp.buildOtpauthUrl('ProxyPoolHub', ADMIN_USER || 'admin', secret);
         const qrSvg = generateQrSvg(otpauthUrl);
         return sendJson(response, 200, {
@@ -1100,24 +1155,35 @@ async function handleApi(request, response, url) {
     }
     if (request.method === 'POST' && url.pathname === '/api/totp/verify-bind') {
         const body = await parseBody(request);
+        if (store.settings.totpEnabled) return sendError(response, 409, '请先验证并停用已有身份验证器');
+        if (!await reauthenticate(request, response, body)) return;
         const code = String(body.code || '').trim();
         const secret = String(body.secret || '').trim();
+        const pending = pendingTotp.get(cookieValue(request, SESSION_COOKIE));
+        if (!pending || pending.expires <= Date.now() || !authMatches(secret, pending.secret)) return sendError(response, 400, '绑定已过期，请重新获取二维码');
         if (!code || !secret) {
             return sendError(response, 400, '缺少动态验证码或密钥');
         }
         if (!totp.verifyTotp(code, secret)) {
             return sendError(response, 400, '动态验证码无效，请确保手机时间同步后重试');
         }
-        store.settings = { ...store.settings, totpSecret: secret, totpEnabled: true };
+        store.settings = { ...store.settings, totpSecret: secret, totpEnabled: true, lastTotpCounter: -1 };
         saveStore();
+        sessions.clear();
+        pendingTotp.clear();
         return sendJson(response, 200, { ok: true, message: 'Google 身份验证器已成功绑定并启用' });
     }
     if (request.method === 'POST' && url.pathname === '/api/totp/disable') {
-        store.settings = { ...store.settings, totpEnabled: false };
+        const body = await parseBody(request);
+        if (!await reauthenticate(request, response, body)) return;
+        store.settings = { ...store.settings, totpEnabled: false, totpSecret: '', lastTotpCounter: -1 };
         saveStore();
+        sessions.clear();
+        pendingTotp.clear();
         return sendJson(response, 200, { ok: true, message: 'Google 身份验证器已停用' });
     }
     if (request.method === 'POST' && url.pathname === '/api/subscriptions/rotate') {
+        if (!await reauthenticate(request, response, await parseBody(request))) return;
         return exclusive(() => {
             store.settings = { ...store.settings, subscriptionToken: crypto.randomBytes(32).toString('hex') };
             saveStore();
@@ -1391,8 +1457,25 @@ function redirect(response, location, headers = {}) {
 }
 
 const server = http.createServer(async (request, response) => {
-    const url = new URL(request.url, 'http://127.0.0.1');
     try {
+        const url = new URL(request.url, 'http://127.0.0.1');
+        response.setHeader('Referrer-Policy', 'same-origin');
+        response.setHeader('X-Content-Type-Options', 'nosniff');
+        response.setHeader('X-Frame-Options', 'DENY');
+        if (!webAllowed(request.socket.remoteAddress)) return sendError(response, 403, 'web source is not allowed');
+        if (!['GET', 'HEAD', 'OPTIONS'].includes(request.method)) {
+            const origin = request.headers.origin;
+            let sameOrigin = !origin;
+            if (origin) {
+                try {
+                    const parsed = new URL(origin);
+                    sameOrigin = ['http:', 'https:'].includes(parsed.protocol) && parsed.host === request.headers.host;
+                } catch { sameOrigin = false; }
+            }
+            if (request.headers['sec-fetch-site'] === 'cross-site' || !sameOrigin) {
+                return sendError(response, 403, 'cross-origin request rejected');
+            }
+        }
         const subscription = request.method === 'GET' && subscriptionRequest(url);
         if (subscription) {
             if (!authMatches(subscription.token, subscriptionToken())) {
@@ -1410,50 +1493,36 @@ const server = http.createServer(async (request, response) => {
             return serveStatic(request, response, url);
         }
         if (request.method === 'POST' && url.pathname === '/login') {
-            if (!loginAllowed(request)) {
-                return serveLogin(response, 429, '登录失败次数过多，请 10 分钟后再试。');
-            }
             const form = await parseForm(request);
             const username = String(form.get('username') || '').trim();
             const password = String(form.get('password') || '');
             const totpCode = String(form.get('totpCode') || '').trim();
             const remember = form.get('remember') === 'on' || form.get('remember') === 'true';
 
-            let valid = false;
-
-            // 模式 1: 使用 Google 身份验证器 6 位动态验证码登录（解决记不住复杂长密码痛点）
-            if (totpCode && /^\d{6}$/.test(totpCode)) {
-                if (authMatches(username, ADMIN_USER) && store.settings?.totpSecret) {
-                    valid = totp.verifyTotp(totpCode, store.settings.totpSecret);
-                }
+            const result = await authenticate(request, username, password, totpCode, true);
+            if (result.status !== 200) {
+                if (result.retryAfter) response.setHeader('Retry-After', result.retryAfter);
+                return serveLogin(response, result.status, result.status === 429 ? '验证过于频繁，请稍后再试。' : '管理账号、密码或动态验证码错误。');
             }
-            // 模式 2: 使用管理员原始密码登录
-            else if (password) {
-                valid = authMatches(username, ADMIN_USER)
-                    && adminPasswordMatches(password);
-            }
-
-            if (!valid) {
-                recordLoginFailure(request);
-                const tip = totpCode ? '管理账号或 6 位动态验证码无效。' : '管理账号或密码错误。';
-                return serveLogin(response, 401, tip);
-            }
-            loginAttempts.delete(loginKey(request));
             const token = crypto.randomBytes(32).toString('hex');
             // 勾选记住登录则保持 7 天 Session，否则为默认 12 小时
             const ttl = remember ? 7 * 24 * 60 * 60 * 1000 : SESSION_TTL_MS;
+            if (sessions.size >= 256) sessions.delete(sessions.keys().next().value);
             sessions.set(token, Date.now() + ttl);
             return redirect(response, '/', {
                 'Set-Cookie': sessionCookie(request, token, Math.floor(ttl / 1000))
             });
         }
-        if (!authorized(request, url)) {
+        const auth = await authorized(request, response, url);
+        if (auth !== true && auth?.status !== 200) {
+            if (auth?.status === 429) return sendError(response, 429, '验证过于频繁，请稍后再试');
             return url.pathname.startsWith('/api/')
                 ? sendError(response, 401, 'login required')
                 : redirect(response, '/login');
         }
         if (request.method === 'POST' && url.pathname === '/logout') {
             sessions.delete(cookieValue(request, SESSION_COOKIE));
+            pendingTotp.delete(cookieValue(request, SESSION_COOKIE));
             return redirect(response, '/login', {
                 'Set-Cookie': sessionCookie(request, '', 0)
             });
@@ -1470,12 +1539,20 @@ const server = http.createServer(async (request, response) => {
         sendError(response, status, error.message);
     }
 });
+server.headersTimeout = 10000;
+server.requestTimeout = 30000;
+server.keepAliveTimeout = 5000;
+setInterval(() => {
+    for (const [token, expires] of sessions) if (expires <= Date.now()) sessions.delete(token);
+    for (const [token, setup] of pendingTotp) if (!sessions.has(token) || setup.expires <= Date.now()) pendingTotp.delete(token);
+}, 60000).unref();
 
 async function main() {
     if (!ADMIN_USER || !ADMIN_PASSWORD || !proxyUser || !proxyPassword) {
         throw new Error('ADMIN_USER, ADMIN_PASSWORD, PROXY_USERNAME and PROXY_PASSWORD are required');
     }
     fs.mkdirSync(DATA_DIR, { recursive: true });
+    if (process.env.MANAGE_FIREWALL === 'true') syncFirewall({ inbounds: [] });
     saveStore();
     await exclusive(rebuild).catch((error) => {
         for (const item of store.proxies) {

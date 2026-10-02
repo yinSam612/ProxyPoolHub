@@ -8,6 +8,7 @@
 
 const fs = require('fs');
 const path = require('path');
+const { redactLogLine } = require('../utils/security');
 
 /**
  * 将带单位的流量字符串（如 1.2 KB, 34.5 MB, 1024 B）转换为纯字节数
@@ -273,7 +274,7 @@ class LogManager {
      */
     feedKernelLogLine(line) {
         if (!line || typeof line !== 'string') return;
-        const text = line.trim();
+        const text = redactLogLine(line).trim();
         if (!text) return;
 
         // 提取连接唯一ID

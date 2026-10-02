@@ -7,6 +7,7 @@ const net = require('net');
 const tls = require('tls');
 const { URL } = require('url');
 const LogManager = require('./log-manager');
+const { redactLogLine } = require('../utils/security');
 
 const MODULE_ROOT_DIR = path.resolve(__dirname, '..', '..');
 const DEFAULT_RUNTIME_DIR = path.join(MODULE_ROOT_DIR, 'runtime');
@@ -1291,6 +1292,9 @@ class ProxyManager {
     }
 
     generateConfig(proxies, relays = [], realityRelays = []) {
+        if (proxies.length && (!this.moduleConfig.proxyUsername || !this.moduleConfig.proxyPassword)) {
+            throw new Error('proxy username and password are required; unauthenticated listeners are not allowed');
+        }
         const inbounds = [];
         const outbounds = [];
         const rules = [];
@@ -1333,6 +1337,7 @@ class ProxyManager {
 
         const relayProxyIds = new Set();
         relays.forEach((relay) => {
+            if (!relay.password) throw new Error('HY2 password is required');
             const tag = `hy2-relay-${relay.id}`;
             const outbound = outboundByProxyId.get(relay.proxyId);
             if (!outbound) throw new Error('invalid HY2 target: associated proxy is not available');
@@ -1463,7 +1468,7 @@ class ProxyManager {
                     if (shouldIgnoreSingBoxErrorLog(line)) {
                         continue;
                     }
-                    process.stderr.write(`${line}\n`);
+                    process.stderr.write(`${redactLogLine(line)}\n`);
                 }
             });
         }

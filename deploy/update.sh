@@ -31,6 +31,15 @@ update_app() {
 
     echo -e "${YELLOW}[2/3] 检查并更新项目依赖...${NC}"
     npm install --omit=dev
+    if ! command -v nft >/dev/null 2>&1; then
+        if command -v apt-get >/dev/null 2>&1; then apt-get install -y nftables;
+        elif command -v yum >/dev/null 2>&1; then yum install -y nftables;
+        elif command -v apk >/dev/null 2>&1; then apk add --no-cache nftables;
+        else echo 'Install nftables before updating.' >&2; exit 1; fi
+    fi
+    sed -i '/^MANAGE_FIREWALL=/d; /^REQUIRE_AUTH=/d' .env
+    printf '\nMANAGE_FIREWALL=true\nREQUIRE_AUTH=true\n' >> .env
+    chmod 600 .env
 
     echo -e "${YELLOW}[3/3] 重启后台服务...${NC}"
     bash "$app_dir/deploy/service.sh"
@@ -40,6 +49,7 @@ update_app() {
     start_port=${start_port:-40000}
     local end_port=$((start_port + 100))
     if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -qw active; then
+        ufw allow "${start_port}:${end_port}/tcp" comment 'ProxyPoolHub Proxy Ports'
         ufw allow "${start_port}:${end_port}/udp" comment 'ProxyPoolHub HY2 Relays'
         ufw allow 39999 comment 'ProxyPoolHub Local VPS'
         ufw allow 443/tcp comment 'ProxyPoolHub ACME TLS-ALPN'

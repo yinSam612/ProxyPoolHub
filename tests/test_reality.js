@@ -24,7 +24,7 @@ async function freePort() {
 }
 
 async function run() {
-    const manager = new ProxyManager({ listenAddress: '127.0.0.1' });
+    const manager = new ProxyManager({ listenAddress: '127.0.0.1', proxyUsername: 'test', proxyPassword: 'test-only-secret' });
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'pph-reality-'));
     const processes = [];
     let target;
