@@ -4,6 +4,7 @@ const fs = require('fs');
 const path = require('path');
 const http = require('http');
 const net = require('net');
+const os = require('os');
 const crypto = require('crypto');
 const { URL } = require('url');
 const ProxyManager = require('./src/core/proxy-manager');
@@ -20,7 +21,7 @@ const ROOT = __dirname;
 function ensureEnvFile(envFile, exampleFile) {
     if (!fs.existsSync(envFile) && fs.existsSync(exampleFile)) {
         try {
-            const randomAdminPass = crypto.randomBytes(8).toString('hex');
+            const randomAdminPass = crypto.randomBytes(16).toString('hex') + 'aA1!';
             const randomProxyPass = crypto.randomBytes(8).toString('hex');
             let template = fs.readFileSync(exampleFile, 'utf8');
             template = template
@@ -63,12 +64,16 @@ const DATA_FILE = path.resolve(process.env.PROXY_DATA_FILE || path.join(DATA_DIR
 const WEB_DIR = path.join(ROOT, 'web');
 const RUNTIME_DIR = path.resolve(process.env.PROXY_RUNTIME_DIR || path.join(ROOT, 'runtime'));
 const BASE_PORT = Number(process.env.PROXY_START_PORT || 40000);
+const LOCAL_NODE_ID = 'local-vps';
+const LOCAL_PORT = Number(process.env.PROXY_LOCAL_PORT || 39999);
+const REALITY_START_PORT = 50000;
+const REALITY_LAST_PORT = 50100;
 const configuredLastPort = Number(process.env.PROXY_PUBLISHED_LAST_PORT || BASE_PORT + 100);
 const LAST_PUBLISHED_PORT = Number.isInteger(configuredLastPort) && configuredLastPort >= BASE_PORT
     ? configuredLastPort
     : BASE_PORT + 100;
 const ADMIN_USER = String(process.env.ADMIN_USER || 'admin');
-const ADMIN_PASSWORD = String(process.env.ADMIN_PASSWORD || crypto.randomBytes(8).toString('hex'));
+const ADMIN_PASSWORD = String(process.env.ADMIN_PASSWORD || crypto.randomBytes(16).toString('hex') + 'aA1!');
 const SESSION_COOKIE = 'proxy_admin_session';
 const SESSION_TTL_MS = 12 * 60 * 60 * 1000;
 const LOGIN_WINDOW_MS = 10 * 60 * 1000;
@@ -100,22 +105,32 @@ let healthCheckPromise = null;
 let healthCheckStartedAt = '';
 let lastHealthCheckError = '';
 let lastHealthTickAt = Date.now();
+let activeAcmeHost = '';
 
 function wasSystemResumed(previousTickAt, currentTickAt, intervalMs) {
     return currentTickAt - previousTickAt > intervalMs + 5000;
 }
 
 function loadStore() {
+    let value;
     try {
-        const value = JSON.parse(fs.readFileSync(DATA_FILE, 'utf8'));
-        return {
-            version: 1,
-            settings: value.settings && typeof value.settings === 'object' ? value.settings : {},
-            proxies: Array.isArray(value.proxies) ? value.proxies : []
-        };
+        value = JSON.parse(fs.readFileSync(DATA_FILE, 'utf8'));
     } catch (error) {
-        return { version: 1, settings: {}, proxies: [] };
+        value = {};
     }
+    const savedProxies = Array.isArray(value.proxies) ? value.proxies : [];
+    const local = savedProxies.find((item) => item.id === LOCAL_NODE_ID) || { enabled: true, status: 'unknown' };
+    const proxies = [{ ...local, id: LOCAL_NODE_ID, name: os.hostname(), isLocal: true, link: '', listenPort: LOCAL_PORT },
+        ...savedProxies.filter((item) => item.id !== LOCAL_NODE_ID)];
+    return {
+        version: 1,
+        settings: value.settings && typeof value.settings === 'object' ? value.settings : {},
+        proxies,
+        relays: (Array.isArray(value.relays) ? value.relays : []).map((relay) => {
+            const proxy = proxies.find((item) => item.id === relay.proxyId);
+            return proxy ? { ...relay, listenPort: proxy.listenPort } : relay;
+        })
+    };
 }
 
 function saveStore() {
@@ -164,6 +179,17 @@ function authMatches(value, expected) {
     return left.length === right.length && crypto.timingSafeEqual(left, right);
 }
 
+function adminPasswordMatches(value) {
+    const stored = String(store.settings?.adminPasswordHash || '');
+    if (!stored) return authMatches(value, ADMIN_PASSWORD);
+    if (String(value).length > 256) return false;
+    const match = /^scrypt:([a-f0-9]{32}):([a-f0-9]{128})$/.exec(stored);
+    return Boolean(match) && crypto.timingSafeEqual(
+        crypto.scryptSync(String(value), Buffer.from(match[1], 'hex'), 64),
+        Buffer.from(match[2], 'hex')
+    );
+}
+
 function basicAuthorized(request) {
     const header = String(request.headers.authorization || '');
     if (!header.startsWith('Basic ')) {
@@ -178,7 +204,7 @@ function basicAuthorized(request) {
     const separator = decoded.indexOf(':');
     return separator >= 0
         && authMatches(decoded.slice(0, separator), ADMIN_USER)
-        && authMatches(decoded.slice(separator + 1), ADMIN_PASSWORD);
+        && adminPasswordMatches(decoded.slice(separator + 1));
 }
 
 function cookieValue(request, name) {
@@ -296,10 +322,12 @@ async function parseForm(request) {
 }
 
 function publicProxy(item) {
-    const parsed = manager.parseProxyLink(item.link, 0);
+    const parsed = item.isLocal ? { type: 'direct', server: item.exitIp || '本机', server_port: 0 } : manager.parseProxyLink(item.link, 0);
+    const relay = store.relays.find((entry) => entry.proxyId === item.id);
     const traffic = manager.logManager ? (manager.logManager.getTrafficSummary()[item.listenPort] || null) : null;
     return {
         id: item.id,
+        isLocal: Boolean(item.isLocal),
         name: item.name || parsed?.displayName || item.id,
         protocol: parsed?.type || 'unknown',
         server: parsed?.server || '',
@@ -307,14 +335,184 @@ function publicProxy(item) {
         link: item.link,
         listenPort: item.listenPort,
         enabled: Boolean(item.enabled),
-        status: item.enabled ? (item.status || 'unknown') : 'disabled',
+        status: !item.enabled ? 'disabled' : !manager.process || manager.process.exitCode !== null ? 'stopped' : (item.status || 'unknown'),
         latencyMs: item.latencyMs || 0,
         exitIp: item.exitIp || '',
         location: item.location || '',
         lastCheckedAt: item.lastCheckedAt || '',
         lastError: item.lastError || '',
+        hy2: relay ? publicRelay(relay) : null,
+        reality: publicReality(item),
         traffic
     };
+}
+
+function detectProxyCores() {
+    const cores = { singBox: Boolean(manager.process?.pid && manager.process.exitCode === null), xray: false };
+    if (process.platform !== 'linux') return cores;
+    for (const entry of fs.readdirSync('/proc')) {
+        if (!/^\d+$/.test(entry)) continue;
+        try {
+            const name = fs.readFileSync(`/proc/${entry}/comm`, 'utf8').trim();
+            if (name === 'sing-box' || name === 'singbox') cores.singBox = true;
+            if (name === 'xray') cores.xray = true;
+            if (cores.singBox && cores.xray) break;
+        } catch (error) { /* process exited or is inaccessible */ }
+    }
+    return cores;
+}
+
+function validateRelayTls({ mode = 'manual', host, certificatePath, keyPath }) {
+    if (mode !== 'manual' && mode !== 'auto') throw new Error('invalid HY2 TLS mode');
+    if (!host || !(net.isIP(host) === 4 || /^(?=.{1,253}$)[a-z0-9-]+(?:\.[a-z0-9-]+)+$/i.test(host))) {
+        throw new Error('invalid HY2 address: 请填写与证书匹配的公网域名或 IPv4');
+    }
+    if (mode === 'auto') {
+        if (net.isIP(host) || !host.split('.').every((label) => /^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/.test(label))
+            || /\.(?:local|localhost|test|invalid)$/.test(host)) {
+            throw new Error('invalid HY2 ACME domain: 自动申请证书需要有效的公网域名，不能使用 IP 或内网域名');
+        }
+        return;
+    }
+    if (!path.isAbsolute(certificatePath) || !path.isAbsolute(keyPath)) {
+        throw new Error('invalid HY2 TLS paths: 请填写证书与私钥的绝对路径');
+    }
+    try {
+        const cert = new crypto.X509Certificate(fs.readFileSync(certificatePath));
+        const key = crypto.createPrivateKey(fs.readFileSync(keyPath));
+        if (Date.now() < Date.parse(cert.validFrom) || Date.now() > Date.parse(cert.validTo)) {
+            throw new Error('expired or not yet valid certificate');
+        }
+        if (!(net.isIP(host) ? cert.checkIP(host) : cert.checkHost(host))) {
+            throw new Error('certificate does not match public host');
+        }
+        if (!cert.publicKey.export({ type: 'spki', format: 'der' }).equals(
+            crypto.createPublicKey(key).export({ type: 'spki', format: 'der' })
+        )) {
+            throw new Error('certificate and private key do not match');
+        }
+    } catch (error) {
+        throw new Error(`invalid HY2 TLS certificate or key: 证书或私钥无效：${error.message}`);
+    }
+}
+
+function relayTlsSettings() {
+    return {
+        mode: String(store.settings?.hy2TlsMode || 'manual'),
+        host: String(store.settings?.hy2Host || ''),
+        certificatePath: String(store.settings?.hy2CertificatePath || ''),
+        keyPath: String(store.settings?.hy2KeyPath || '')
+    };
+}
+
+function relayCertificateStatus(tls) {
+    if (tls.mode !== 'auto') return { status: 'manual' };
+    if (!store.relays.some(relayIsActive)) return { status: 'not_requested' };
+    const certificateDir = path.join(RUNTIME_DIR, 'acme', 'certificates');
+    try {
+        for (const issuer of fs.readdirSync(certificateDir)) {
+            const certPath = path.join(certificateDir, issuer, tls.host, `${tls.host}.crt`);
+            const keyPath = path.join(certificateDir, issuer, tls.host, `${tls.host}.key`);
+            if (!fs.existsSync(certPath) || !fs.existsSync(keyPath)) continue;
+            const cert = new crypto.X509Certificate(fs.readFileSync(certPath));
+            if (cert.checkHost(tls.host) && Date.now() >= Date.parse(cert.validFrom)
+                && Date.now() < Date.parse(cert.validTo)) {
+                return { status: 'ready', expiresAt: cert.validTo };
+            }
+        }
+    } catch (error) {
+        if (error.code !== 'ENOENT') console.error(`[proxy] read ACME certificate: ${error.message}`);
+    }
+    return { status: manager.process?.exitCode === null ? 'pending' : 'error' };
+}
+
+function assertAcmePortAvailable() {
+    return new Promise((resolve, reject) => {
+        const listener = net.createServer();
+        listener.once('error', () => reject(new Error('invalid HY2 ACME port: 自动申请证书需要空闲的 TCP 443 端口；请关闭占用服务，或改用已有证书')));
+        listener.listen(443, '0.0.0.0', () => listener.close(resolve));
+    });
+}
+
+function publicRelay(item) {
+    const host = relayTlsSettings().host;
+    const proxy = findProxy(item.proxyId);
+    const name = proxy?.name || (proxy && manager.parseProxyLink(proxy.link, 0)?.displayName) || proxy?.id || '';
+    const port = proxy?.listenPort || item.listenPort;
+    const label = `${name}:${proxy?.exitIp || '未知IP'}-${proxy?.countryCode || proxy?.location?.split(' / ')[0] || '未知'}`;
+    return {
+        id: item.id,
+        proxyId: item.proxyId || '',
+        proxyName: name,
+        status: !proxy ? 'unbound' : !proxy.enabled ? 'node_disabled' : item.enabled ? 'enabled' : 'disabled',
+        listenPort: port,
+        enabled: Boolean(item.enabled),
+        link: proxy ? `hysteria2://${encodeURIComponent(item.password)}@${host}:${port}/?sni=${encodeURIComponent(host)}#${encodeURIComponent(label).replace(/%3A/g, ':')}` : ''
+    };
+}
+
+function relayIsActive(item) {
+    return Boolean(item.enabled && findProxy(item.proxyId)?.enabled);
+}
+
+function publicReality(proxy) {
+    const item = proxy.reality;
+    if (!item) return null;
+    const label = `${proxy.name || proxy.id}:${proxy.exitIp || '未知IP'}-${proxy.countryCode || proxy.location?.split(' / ')[0] || '未知'}`;
+    const params = new URLSearchParams({
+        encryption: 'none', security: 'reality', type: 'raw', flow: 'xtls-rprx-vision',
+        sni: item.serverName, fp: 'chrome', pbk: item.publicKey, sid: item.shortId
+    });
+    return {
+        host: item.host, serverName: item.serverName, listenPort: item.listenPort, enabled: item.enabled,
+        status: !proxy.enabled ? 'node_disabled' : item.enabled ? 'enabled' : 'disabled',
+        link: `vless://${item.uuid}@${item.host}:${item.listenPort}?${params}#${encodeURIComponent(label).replace(/%3A/g, ':')}`
+    };
+}
+
+function validateRealityAddress(host, serverName) {
+    const isDomain = (value) => value.length <= 253 && value.includes('.') && value.split('.').every(
+        (label) => /^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/i.test(label)
+    );
+    if (!(net.isIP(host) === 4 || isDomain(host))) throw new Error('invalid Reality address: 请填写公网 IPv4 或直连域名');
+    if (!isDomain(serverName) || /\.(?:local|localhost|invalid|test)$/i.test(serverName)) {
+        throw new Error('invalid Reality SNI: 请填写支持 TLS 1.3 的公网目标域名');
+    }
+}
+
+function assertRealityPortAvailable(port) {
+    return new Promise((resolve, reject) => {
+        const listener = net.createServer();
+        listener.once('error', (error) => reject(new Error(`invalid Reality TCP port: TCP ${port} 不可用 (${error.code})`)));
+        listener.listen(port, manager.moduleConfig.listenAddress, () => listener.close(resolve));
+    });
+}
+
+async function allocateRealityPort() {
+    const used = new Set([Number(process.env.WEB_PORT || 3100), ...store.proxies.map((proxy) => proxy.listenPort),
+        ...store.proxies.map((proxy) => proxy.reality?.listenPort)]);
+    for (let port = REALITY_START_PORT; port <= REALITY_LAST_PORT; port += 1) {
+        if (used.has(port)) continue;
+        try { await assertRealityPortAvailable(port); return port; }
+        catch (error) { if (!error.message.includes('EADDRINUSE')) throw error; }
+    }
+    throw new Error('no available Reality TCP ports (50000-50100)');
+}
+
+function realityCredentials() {
+    const { privateKey, publicKey } = crypto.generateKeyPairSync('x25519');
+    return {
+        uuid: crypto.randomUUID(), shortId: crypto.randomBytes(8).toString('hex'),
+        privateKey: privateKey.export({ format: 'der', type: 'pkcs8' }).subarray(-32).toString('base64url'),
+        publicKey: publicKey.export({ format: 'der', type: 'spki' }).subarray(-32).toString('base64url')
+    };
+}
+
+function requireRelayProxy(proxyId) {
+    const proxy = findProxy(String(proxyId || ''));
+    if (!proxy) throw new Error('invalid HY2 target: 请选择已导入的关联节点');
+    if (!proxy.enabled) throw new Error('invalid HY2 target: 关联节点已停用，请先启用节点');
+    return proxy;
 }
 
 function publicSettings(request) {
@@ -365,6 +563,7 @@ function applyResult(item, result) {
     item.latencyMs = result.success ? Number(result.latencyMs || 0) : 0;
     if (result.nodeInfo?.ip) {
         item.exitIp = result.nodeInfo.ip;
+        item.countryCode = result.nodeInfo.countryCode || '';
         item.location = [result.nodeInfo.country, result.nodeInfo.region, result.nodeInfo.city]
             .filter(Boolean)
             .join(' / ');
@@ -397,6 +596,7 @@ function applyNodeInfo(results) {
         const item = store.proxies.find((candidate) => candidate.enabled && Number(candidate.listenPort) === Number(result.port));
         if (!item) continue;
         item.exitIp = result.nodeInfo.ip;
+        item.countryCode = result.nodeInfo.countryCode || '';
         item.location = [result.nodeInfo.country, result.nodeInfo.region, result.nodeInfo.city]
             .filter(Boolean)
             .join(' / ');
@@ -449,8 +649,15 @@ function watchCore(core) {
 async function rebuild(options = {}) {
     const skipTest = options.skipTest !== false;
     const active = store.proxies.filter((item) => item.enabled);
+    const relays = store.relays.filter(relayIsActive);
+    const tls = relayTlsSettings();
+    if (relays.length) validateRelayTls(tls);
+    if (relays.length && tls.mode === 'auto' && !(activeAcmeHost && manager.process?.exitCode === null)) {
+        await assertAcmePortAvailable();
+    }
     manager.stop({ silent: true });
-    if (active.length === 0) {
+    activeAcmeHost = '';
+    if (active.length === 0 && relays.length === 0) {
         for (const item of store.proxies) {
             item.status = 'disabled';
         }
@@ -459,6 +666,8 @@ async function rebuild(options = {}) {
     }
     await manager.start({
         proxies: active,
+        relays: relays.map((item) => ({ ...item, ...tls })),
+        realityRelays: active.filter((item) => item.reality?.enabled).map((item) => ({ ...item.reality, proxyId: item.id })),
         filterInvalid: false,
         requireValid: false,
         eagerNodeInfo: false,
@@ -474,6 +683,7 @@ async function rebuild(options = {}) {
         refreshNodeInfo();
     }
     watchCore(manager.process);
+    activeAcmeHost = relays.length && tls.mode === 'auto' ? tls.host : '';
     coreRestartAttempt = 0;
 }
 
@@ -604,7 +814,19 @@ function firstAvailablePort(items, firstPort, lastPort) {
 }
 
 function allocatePort() {
-    return firstAvailablePort(store.proxies, BASE_PORT, LAST_PUBLISHED_PORT);
+    return firstAvailablePort(store.proxies.concat(store.proxies.map((item) => item.reality || {})), BASE_PORT, LAST_PUBLISHED_PORT);
+}
+
+function assertRelayPortAvailable(port) {
+    return new Promise((resolve, reject) => {
+        const address = manager.moduleConfig.listenAddress;
+        const socket = require('dgram').createSocket(net.isIP(address) === 6 ? 'udp6' : 'udp4');
+        socket.once('error', () => {
+            socket.close();
+            reject(new Error(`invalid HY2 UDP port: UDP ${port} 已被占用，不能开启该节点 HY2`));
+        });
+        socket.bind({ port: Number(port), address, exclusive: true }, () => socket.close(resolve));
+    });
 }
 
 function newProxyItem(value, parsed, name, listenPort) {
@@ -704,6 +926,141 @@ function triggerAsyncNodeCheck(targetItems) {
 }
 
 async function handleApi(request, response, url) {
+    if (request.method === 'POST' && url.pathname === '/api/admin/password') {
+        const body = await parseBody(request);
+        const currentPassword = String(body.currentPassword || '');
+        const newPassword = String(body.newPassword || '');
+        await exclusive(() => {
+            if (!adminPasswordMatches(currentPassword)) {
+                return sendError(response, 403, '当前管理员密码错误');
+            }
+            if (newPassword.length < 12 || newPassword.length > 256 || !/[a-z]/.test(newPassword) || !/[A-Z]/.test(newPassword)
+                || !/[0-9]/.test(newPassword) || !/[^a-zA-Z0-9\s]/.test(newPassword)) {
+                return sendError(response, 400, '新密码至少 12 位，须包含大小写字母、数字和符号');
+            }
+            if (adminPasswordMatches(newPassword)) {
+                return sendError(response, 400, '新密码不能与当前密码相同');
+            }
+            const salt = crypto.randomBytes(16);
+            const hash = crypto.scryptSync(newPassword, salt, 64);
+            store.settings = { ...store.settings, adminPasswordHash: `scrypt:${salt.toString('hex')}:${hash.toString('hex')}` };
+            saveStore();
+            sessions.clear();
+            sendJson(response, 200, { ok: true });
+        });
+        return;
+    }
+    const realityMatch = url.pathname.match(/^\/api\/proxies\/([^/]+)\/reality$/);
+    if (realityMatch) {
+        const body = request.method === 'PUT' ? await parseBody(request) : {};
+        if (!['PUT', 'DELETE'].includes(request.method)) return sendError(response, 405, 'method not allowed');
+        await exclusive(async () => {
+            const proxy = findProxy(realityMatch[1]);
+            if (!proxy) return sendError(response, 404, 'proxy not found');
+            if (request.method === 'DELETE') {
+                await commit((current) => { delete current.proxies.find((item) => item.id === proxy.id).reality; });
+                return sendJson(response, 200, { ok: true });
+            }
+            const host = String(body.host ?? proxy.reality?.host ?? '').trim().toLowerCase();
+            const serverName = String(body.serverName ?? proxy.reality?.serverName ?? 'www.apple.com').trim().toLowerCase();
+            const enabled = body.enabled ?? true;
+            if (typeof enabled !== 'boolean') throw new Error('invalid Reality enabled value');
+            validateRealityAddress(host, serverName);
+            if (enabled && !proxy.enabled) throw new Error('invalid Reality target: 请先启用关联节点');
+            if (enabled && proxy.reality && !proxy.reality.enabled) await assertRealityPortAvailable(proxy.reality.listenPort);
+            const reality = proxy.reality || { ...realityCredentials(), listenPort: await allocateRealityPort() };
+            await commit((current) => {
+                current.proxies.find((item) => item.id === proxy.id).reality = { ...reality, host, serverName, enabled };
+            });
+            sendJson(response, 200, publicReality(findProxy(proxy.id)));
+        });
+        return;
+    }
+    if (request.method === 'GET' && url.pathname === '/api/relays') {
+        const tls = relayTlsSettings();
+        return sendJson(response, 200, {
+            cores: detectProxyCores(),
+            managedCore: Boolean(manager.process?.pid && manager.process.exitCode === null),
+            tls: { ...tls, ...relayCertificateStatus(tls) },
+            relays: store.relays.map(publicRelay)
+        });
+    }
+    if (request.method === 'PUT' && url.pathname === '/api/relays/tls') {
+        const body = await parseBody(request);
+        const tls = {
+            mode: String(body.mode || 'manual'),
+            host: String(body.host || '').trim().toLowerCase(),
+            certificatePath: String(body.certificatePath || '').trim(),
+            keyPath: String(body.keyPath || '').trim()
+        };
+        validateRelayTls(tls);
+        await exclusive(async () => {
+            const change = (current) => {
+                current.settings = {
+                    ...current.settings,
+                    hy2TlsMode: tls.mode,
+                    hy2Host: tls.host,
+                    hy2CertificatePath: tls.certificatePath,
+                    hy2KeyPath: tls.keyPath
+                };
+            };
+            if (store.relays.some(relayIsActive)) {
+                await commit(change);
+            } else {
+                change(store);
+                saveStore();
+            }
+            sendJson(response, 200, { tls: relayTlsSettings() });
+        });
+        return;
+    }
+    if (request.method === 'POST' && url.pathname === '/api/relays') {
+        const body = await parseBody(request);
+        await exclusive(async () => {
+            const proxy = requireRelayProxy(body.proxyId);
+            const tls = relayTlsSettings();
+            validateRelayTls(tls);
+            const existing = store.relays.find((item) => item.proxyId === proxy.id);
+            if (existing) return sendJson(response, 200, publicRelay(existing));
+            await assertRelayPortAvailable(proxy.listenPort);
+            const relay = {
+                id: newId(),
+                proxyId: proxy.id,
+                listenPort: proxy.listenPort,
+                password: crypto.randomBytes(24).toString('base64url'),
+                enabled: true
+            };
+            await commit((current) => current.relays.push(relay));
+            sendJson(response, 201, publicRelay(relay));
+        });
+        return;
+    }
+    const relayMatch = url.pathname.match(/^\/api\/relays\/([a-f0-9]{24})(?:\/(enable|disable))?$/);
+    if (relayMatch) {
+        const relay = store.relays.find((item) => item.id === relayMatch[1]);
+        if (!relay) return sendError(response, 404, 'HY2 relay not found');
+        if (request.method === 'DELETE' && !relayMatch[2]) {
+            await exclusive(async () => {
+                await commit((current) => { current.relays = current.relays.filter((item) => item.id !== relay.id); });
+                sendJson(response, 200, { ok: true });
+            });
+            return;
+        }
+        if (request.method === 'POST' && relayMatch[2]) {
+            await exclusive(async () => {
+                if (relayMatch[2] === 'enable') {
+                    const proxy = requireRelayProxy(relay.proxyId);
+                    if (!relayIsActive(relay)) await assertRelayPortAvailable(proxy.listenPort);
+                }
+                await commit((current) => {
+                    current.relays.find((item) => item.id === relay.id).enabled = relayMatch[2] === 'enable';
+                });
+                sendJson(response, 200, publicRelay(relay));
+            });
+            return;
+        }
+        return sendError(response, 405, 'method not allowed');
+    }
     if (request.method === 'GET' && url.pathname === '/api/logs') {
         const port = Number(url.searchParams.get('port') || 0);
         const keyword = String(url.searchParams.get('keyword') || '').trim();
@@ -768,10 +1125,11 @@ async function handleApi(request, response, url) {
         });
     }
     if (request.method === 'GET' && url.pathname === '/api/status') {
-        const online = store.proxies.filter((item) => item.enabled && item.status === 'online').length;
+        const coreRunning = Boolean(manager.process && manager.process.exitCode === null);
+        const online = coreRunning ? store.proxies.filter((item) => item.enabled && item.status === 'online').length : 0;
         return sendJson(response, 200, {
             service: 'running',
-            core: manager.process && manager.process.exitCode === null ? 'running' : 'stopped',
+            core: coreRunning ? 'running' : 'stopped',
             pid: manager.process?.pid || null,
             total: store.proxies.length,
             enabled: store.proxies.filter((item) => item.enabled).length,
@@ -786,6 +1144,17 @@ async function handleApi(request, response, url) {
     }
     if (request.method === 'GET' && url.pathname === '/api/proxies') {
         return sendJson(response, 200, store.proxies.map(publicProxy));
+    }
+    if (request.method === 'GET' && url.pathname === '/api/proxies/export') {
+        const payload = JSON.stringify({ version: 1, nodes: store.proxies.filter((item) => !item.isLocal)
+            .map((item) => ({ name: item.name, link: item.link, enabled: Boolean(item.enabled) })) }, null, 2);
+        response.writeHead(200, {
+            'Content-Type': 'application/json; charset=utf-8',
+            'Content-Disposition': 'attachment; filename="proxypoolhub-nodes.json"',
+            'Cache-Control': 'no-store',
+            'Content-Length': Buffer.byteLength(payload)
+        });
+        return response.end(payload);
     }
 
     const testAll = request.method === 'POST' && url.pathname === '/api/proxies/test-all';
@@ -804,21 +1173,34 @@ async function handleApi(request, response, url) {
             const invalid = [];
             let skipped = 0;
             const knownLinks = new Set(store.proxies.map((item) => item.link));
-            const lines = String(typeof body.links === 'string' ? body.links : '').split(/\r?\n/);
+            const text = String(typeof body.links === 'string' ? body.links : '').trim();
+            let entries;
+            if (text.startsWith('{')) {
+                let backup;
+                try { backup = JSON.parse(text); } catch (error) { throw new Error('invalid node backup JSON'); }
+                if (backup.version !== 1 || !Array.isArray(backup.nodes)) throw new Error('invalid node backup format');
+                entries = backup.nodes;
+            } else {
+                entries = text.split(/\r?\n/).map((link) => ({ link }));
+            }
 
-            lines.forEach((line, index) => {
-                const link = normalizeProxyLink(line);
+            entries.forEach((entry, index) => {
+                const link = normalizeProxyLink(entry?.link);
                 if (!link || link.startsWith('#')) return;
                 if (knownLinks.has(link)) {
                     skipped += 1;
                     return;
                 }
                 try {
+                    if (entry.enabled != null && typeof entry.enabled !== 'boolean') throw new Error('invalid node enabled value');
                     const { value, parsed } = validateLink(link);
                     const listenPort = firstAvailablePort(
-                        store.proxies.concat(imported), BASE_PORT, LAST_PUBLISHED_PORT
+                        store.proxies.concat(imported, store.proxies.map((item) => item.reality || {})), BASE_PORT, LAST_PUBLISHED_PORT
                     );
-                    imported.push(newProxyItem(value, parsed, '', listenPort));
+                    const item = newProxyItem(value, parsed, entry.name || '', listenPort);
+                    item.enabled = entry.enabled !== false;
+                    if (!item.enabled) item.status = 'disabled';
+                    imported.push(item);
                     knownLinks.add(value);
                 } catch (error) {
                     invalid.push({ line: index + 1, error: error.message });
@@ -849,7 +1231,8 @@ async function handleApi(request, response, url) {
         await exclusive(async () => {
             await commit((current) => {
                 const initialLength = current.proxies.length;
-                current.proxies = current.proxies.filter((candidate) => !idSet.has(candidate.id));
+                current.proxies = current.proxies.filter((candidate) => candidate.isLocal || !idSet.has(candidate.id));
+                current.relays = current.relays.filter((relay) => relay.proxyId === LOCAL_NODE_ID || !idSet.has(relay.proxyId));
                 deletedCount = initialLength - current.proxies.length;
             });
             sendJson(response, 200, { ok: true, deleted: deletedCount });
@@ -884,6 +1267,9 @@ async function handleApi(request, response, url) {
         return sendError(response, 404, 'proxy not found');
     }
     const action = match[2];
+    if (item.isLocal && (request.method === 'DELETE' || request.method === 'PUT')) {
+        return sendError(response, 403, '本机 VPS 节点不能删除或修改，只能启用或禁用');
+    }
     if (request.method === 'PUT' && !action) {
         const body = await parseBody(request);
         const { value, parsed } = validateLink(body.link);
@@ -906,6 +1292,7 @@ async function handleApi(request, response, url) {
                 candidate.status = candidate.enabled ? 'testing' : 'disabled';
                 candidate.latencyMs = 0;
                 candidate.exitIp = '';
+                candidate.countryCode = '';
                 candidate.location = '';
                 candidate.lastCheckedAt = '';
                 candidate.lastError = '';
@@ -918,6 +1305,7 @@ async function handleApi(request, response, url) {
         await exclusive(async () => {
             await commit((current) => {
                 current.proxies = current.proxies.filter((candidate) => candidate.id !== item.id);
+                current.relays = current.relays.filter((relay) => relay.proxyId !== item.id);
             });
             sendJson(response, 200, { ok: true });
         });
@@ -957,14 +1345,15 @@ function serveStatic(request, response, url) {
         '/logs.html': 'logs.html',
         '/logs.js': 'logs.js',
         '/app.js': 'app.js',
-        '/style.css': 'style.css'
+        '/style.css': 'style.css',
+        '/lucide.svg': 'lucide.svg'
     };
     const name = files[url.pathname];
     if (!name) {
         return sendError(response, 404, 'not found');
     }
     const file = path.join(WEB_DIR, name);
-    const types = { '.html': 'text/html; charset=utf-8', '.js': 'text/javascript; charset=utf-8', '.css': 'text/css; charset=utf-8' };
+    const types = { '.html': 'text/html; charset=utf-8', '.js': 'text/javascript; charset=utf-8', '.css': 'text/css; charset=utf-8', '.svg': 'image/svg+xml' };
     response.writeHead(200, {
         'Content-Type': types[path.extname(file)],
         'Cache-Control': 'no-store',
@@ -1041,7 +1430,7 @@ const server = http.createServer(async (request, response) => {
             // 模式 2: 使用管理员原始密码登录
             else if (password) {
                 valid = authMatches(username, ADMIN_USER)
-                    && authMatches(password, ADMIN_PASSWORD);
+                    && adminPasswordMatches(password);
             }
 
             if (!valid) {
@@ -1087,6 +1476,7 @@ async function main() {
         throw new Error('ADMIN_USER, ADMIN_PASSWORD, PROXY_USERNAME and PROXY_PASSWORD are required');
     }
     fs.mkdirSync(DATA_DIR, { recursive: true });
+    saveStore();
     await exclusive(rebuild).catch((error) => {
         for (const item of store.proxies) {
             if (item.enabled) {
@@ -1105,7 +1495,7 @@ async function main() {
         if (isAuthDisabled()) {
             console.log('[proxy] Windows 免密模式已生效：直接在浏览器访问即可，无需输入密码');
         } else {
-            console.log(`[proxy] 管理账号: ${ADMIN_USER} | 管理密码: ${ADMIN_PASSWORD}`);
+            console.log(`[proxy] 管理账号: ${ADMIN_USER}`);
         }
     });
     const interval = Math.max(10000, Number(process.env.PROXY_HEALTH_INTERVAL_MS || 60000));
@@ -1141,4 +1531,4 @@ if (require.main === module) {
     });
 }
 
-module.exports = { buildSubscription, firstAvailablePort, normalizeProxyLink, wasSystemResumed };
+module.exports = { buildSubscription, firstAvailablePort, normalizeProxyLink, wasSystemResumed, realityCredentials, validateRealityAddress };

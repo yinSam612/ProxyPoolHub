@@ -819,9 +819,10 @@ function parseGeoPayload(payload) {
     const ip = String(payload.query || payload.ip || '').trim();
     if (!ip || !net.isIP(ip)) return null;
     const country = String(payload.country || payload.country_name || '').trim();
+    const countryCode = String(payload.countryCode || payload.country_code || '').trim().toUpperCase();
     const region = String(payload.regionName || payload.region || '').trim();
     const city = String(payload.city || '').trim();
-    return { ip, country, region, city };
+    return { ip, country, countryCode, region, city };
 }
 
 /**
@@ -885,7 +886,7 @@ async function lookupIpGeo(ip, timeoutMs = 8000) {
 
     // 2. 备用源：http://ip-api.com/json/ (海外直连高效)
     try {
-        const res = await fetchJsonDirect(`http://ip-api.com/json/${encodeURIComponent(targetIp)}?fields=status,country,regionName,city,query`, timeoutMs);
+        const res = await fetchJsonDirect(`http://ip-api.com/json/${encodeURIComponent(targetIp)}?fields=status,country,countryCode,regionName,city,query`, timeoutMs);
         const geo = parseGeoPayload(res);
         if (geo && (geo.country || geo.region || geo.city)) {
             return geo;
@@ -1184,7 +1185,8 @@ class ProxyManager {
         const security = url.searchParams.get('security') || 'none';
         const sni = url.searchParams.get('sni') || url.searchParams.get('peer') || server;
         const fingerprint = url.searchParams.get('fp') || 'chrome';
-        const transportType = url.searchParams.get('type') || 'tcp';
+        const transportType = (url.searchParams.get('type') || 'tcp').toLowerCase();
+        if (!['tcp', 'raw', 'ws', 'grpc'].includes(transportType)) return null;
         const host = url.searchParams.get('host') || url.searchParams.get('sni') || '';
         const insecure = url.searchParams.get('insecure') === '1' || url.searchParams.get('allowInsecure') === '1';
 
@@ -1288,18 +1290,24 @@ class ProxyManager {
         return config;
     }
 
-    generateConfig(proxies) {
+    generateConfig(proxies, relays = [], realityRelays = []) {
         const inbounds = [];
         const outbounds = [];
         const rules = [];
+        const outboundByProxyId = new Map();
+        const portByProxyId = new Map();
 
         proxies.forEach((proxy, index) => {
             const port = this.getProxyPort(proxy, index);
             const inboundTag = `inbound-${index}`;
             const outboundTag = proxy.tag;
-            const { displayName, listenPort, ...proxyConfig } = proxy;
+            const { displayName, listenPort, proxyId, ...proxyConfig } = proxy;
             void displayName;
             void listenPort;
+            if (proxyId) {
+                outboundByProxyId.set(proxyId, outboundTag);
+                portByProxyId.set(proxyId, port);
+            }
 
             const inbound = {
                 type: 'mixed',
@@ -1321,6 +1329,62 @@ class ProxyManager {
                 inbound: [inboundTag],
                 outbound: outboundTag
             });
+        });
+
+        const relayProxyIds = new Set();
+        relays.forEach((relay) => {
+            const tag = `hy2-relay-${relay.id}`;
+            const outbound = outboundByProxyId.get(relay.proxyId);
+            if (!outbound) throw new Error('invalid HY2 target: associated proxy is not available');
+            if (relayProxyIds.has(relay.proxyId)) throw new Error('invalid HY2 target: one listener per proxy');
+            relayProxyIds.add(relay.proxyId);
+            const tls = relay.mode === 'auto'
+                ? {
+                    enabled: true,
+                    acme: {
+                        domain: [relay.host],
+                        data_directory: path.join(this.moduleConfig.runtimeDir, 'acme'),
+                        disable_http_challenge: true
+                    }
+                }
+                : {
+                    enabled: true,
+                    certificate_path: relay.certificatePath,
+                    key_path: relay.keyPath
+                };
+            inbounds.push({
+                type: 'hysteria2',
+                tag,
+                listen: this.moduleConfig.listenAddress,
+                listen_port: portByProxyId.get(relay.proxyId),
+                users: [{ password: relay.password }],
+                tls
+            });
+            rules.push({ inbound: [tag], outbound });
+        });
+
+        const realityProxyIds = new Set();
+        const tcpPorts = new Set(inbounds.filter((item) => item.type === 'mixed').map((item) => item.listen_port));
+        realityRelays.forEach((relay) => {
+            const outbound = outboundByProxyId.get(relay.proxyId);
+            if (!outbound || realityProxyIds.has(relay.proxyId)) throw new Error('invalid Reality target: one listener per available proxy');
+            if (tcpPorts.has(relay.listenPort)) throw new Error('invalid Reality TCP port: already in use');
+            realityProxyIds.add(relay.proxyId);
+            tcpPorts.add(relay.listenPort);
+            const tag = `reality-${relay.proxyId}`;
+            inbounds.push({
+                type: 'vless', tag, listen: this.moduleConfig.listenAddress, listen_port: relay.listenPort,
+                users: [{ uuid: relay.uuid, flow: 'xtls-rprx-vision' }],
+                tls: {
+                    enabled: true, server_name: relay.serverName,
+                    reality: {
+                        enabled: true,
+                        handshake: { server: relay.serverName, server_port: 443 },
+                        private_key: relay.privateKey, short_id: [relay.shortId]
+                    }
+                }
+            });
+            rules.push({ inbound: [tag], outbound });
         });
 
         outbounds.push({ type: 'direct', tag: 'direct' });
@@ -1423,8 +1487,9 @@ class ProxyManager {
         this.proxies = Array.isArray(proxies) ? proxies.slice() : [];
         this.proxiesCount = this.proxies.length;
         this.validPorts = [];
-        const config = this.generateConfig(this.proxies);
-        fs.writeFileSync(this.configPath, JSON.stringify(config, null, 2));
+        const config = this.generateConfig(this.proxies, options.relays || [], options.realityRelays || []);
+        fs.writeFileSync(this.configPath, JSON.stringify(config, null, 2), { mode: 0o600 });
+        fs.chmodSync(this.configPath, 0o600);
         this.spawnSingBoxProcess(detachProcess);
 
         // 如果明确指定跳过测试，仅需极短等待确认进程启动成功即可快速返回，极大提升 Web 操作响应性
@@ -1485,10 +1550,13 @@ class ProxyManager {
         if (Array.isArray(options.proxies)) {
             proxies = options.proxies.map((entry, index) => {
                 const link = typeof entry === 'string' ? entry : entry && entry.link;
-                const parsed = this.parseProxyLink(link, index);
+                const parsed = entry?.isLocal
+                    ? { type: 'direct', tag: `proxy-${index}`, displayName: entry.name }
+                    : this.parseProxyLink(link, index);
                 if (parsed && entry && typeof entry === 'object' && Number(entry.listenPort) > 0) {
                     parsed.listenPort = Number(entry.listenPort);
                 }
+                if (parsed && entry && typeof entry === 'object' && entry.id) parsed.proxyId = entry.id;
                 return parsed;
             }).filter(Boolean);
         } else {
@@ -1502,7 +1570,7 @@ class ProxyManager {
         this.proxiesCount = proxies.length;
         this.loadedProxyCount = proxies.length;
 
-        if (this.proxiesCount <= 0) {
+        if (this.proxiesCount <= 0 && !(options.relays || []).length) {
             throw new Error('no valid proxy links found in proxies.txt');
         }
 

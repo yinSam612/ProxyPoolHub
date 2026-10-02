@@ -5,6 +5,10 @@
 # ==============================================================================
 
 set -e
+if [ "$(id -u)" -ne 0 ]; then
+    echo '请使用 sudo 或 root 执行更新脚本。' >&2
+    exit 1
+fi
 
 GREEN='\033[0;32m'
 BLUE='\033[0;34m'
@@ -23,21 +27,30 @@ update_app() {
     cd "$app_dir"
 
     echo -e "${YELLOW}[1/3] 从远端拉取最新代码...${NC}"
-    git fetch --all
-    git pull
+    git pull --ff-only
 
     echo -e "${YELLOW}[2/3] 检查并更新项目依赖...${NC}"
     npm install --omit=dev
 
     echo -e "${YELLOW}[3/3] 重启后台服务...${NC}"
-    if command -v systemctl >/dev/null 2>&1 && systemctl is-active --quiet proxypoolhub 2>/dev/null; then
-        systemctl restart proxypoolhub
-        echo -e "${GREEN}✓ Systemd 服务已重启并应用最新版本 (proxypoolhub)${NC}"
-    elif command -v pm2 >/dev/null 2>&1 && pm2 describe proxypoolhub >/dev/null 2>&1; then
-        pm2 restart proxypoolhub
-        echo -e "${GREEN}✓ PM2 服务已重启并应用最新版本 (proxypoolhub)${NC}"
-    else
-        echo -e "${YELLOW}未检测到正在运行的 proxypoolhub 服务，请根据实际情况手动启动服务。${NC}"
+    bash "$app_dir/deploy/service.sh"
+
+    local start_port
+    start_port=$(grep '^PROXY_START_PORT=' "$app_dir/.env" 2>/dev/null | cut -d= -f2)
+    start_port=${start_port:-40000}
+    local end_port=$((start_port + 100))
+    if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -qw active; then
+        ufw allow "${start_port}:${end_port}/udp" comment 'ProxyPoolHub HY2 Relays'
+        ufw allow 39999 comment 'ProxyPoolHub Local VPS'
+        ufw allow 443/tcp comment 'ProxyPoolHub ACME TLS-ALPN'
+        ufw allow 50000:50100/tcp comment 'ProxyPoolHub Reality'
+    elif command -v firewall-cmd >/dev/null 2>&1 && firewall-cmd --state >/dev/null 2>&1; then
+        firewall-cmd --permanent --add-port="${start_port}-${end_port}/udp"
+        firewall-cmd --permanent --add-port=39999/tcp
+        firewall-cmd --permanent --add-port=39999/udp
+        firewall-cmd --permanent --add-port=443/tcp
+        firewall-cmd --permanent --add-port=50000-50100/tcp
+        firewall-cmd --reload
     fi
 }
 

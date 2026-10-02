@@ -6,7 +6,8 @@
   "scripts": {
     "start": "node server.js",
     "web": "node server.js",
-    "test": "node --check server.js && node --check src/core/proxy-manager.js && node tests/test_log_manager.js && node tests/test_logs_page.js && node tests/test_subscription.js && node tests/test_totp.js && node tests/test_e2e.js"
+    "test:web": "node tests/test_web.js",
+    "test": "node --check server.js && node --check src/core/proxy-manager.js && node --check web/app.js && node tests/test_log_manager.js && node tests/test_logs_page.js && node tests/test_subscription.js && node tests/test_relay.js && node tests/test_reality.js && node tests/test_totp.js && node tests/test_e2e.js"
   },
   "keywords": [
     "proxy-pool",
@@ -21,7 +22,7 @@
   "author": "",
   "license": "MIT",
   "engines": {
-    "node": ">=14.0.0"
+    "node": ">=18.0.0"
   },
   "dependencies": {}
 }
