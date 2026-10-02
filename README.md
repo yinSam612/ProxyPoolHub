@@ -26,14 +26,7 @@ ssh -L 3100:127.0.0.1:3100 root@VPS_IP
 
 ### 使用域名访问（可选）
 
-在 `/opt/proxypoolhub/.env` 设置以下两项，将示例 IP 换成实际反代容器 IP，然后执行 `pph restart`：
-
-```dotenv
-WEB_HOST=0.0.0.0
-TRUSTED_PROXY_CIDRS=172.18.0.2/32
-```
-
-Nginx Proxy Manager 上游可填 `http://172.17.0.1:3100`，启用 HTTPS。地址须能从反代容器访问；不要填容器自己的 `127.0.0.1`，不要把受信任来源设为 `0.0.0.0/0`。
+可按需使用 HTTPS 反向代理，转发到本项目的 `3100` 端口。在 `.env` 的 `TRUSTED_PROXY_CIDRS` 中填写实际反代来源 IP/CIDR；跨容器或服务器连接时，按需调整 `WEB_HOST`。修改后执行 `pph restart`。不要将受信任来源设为 `0.0.0.0/0`。
 
 ## 添加和使用节点
 
@@ -61,7 +54,7 @@ Nginx Proxy Manager 上游可填 `http://172.17.0.1:3100`，启用 HTTPS。地�
 
 自动申请证书：域名直连此 VPS，Cloudflare 使用灰云，公网 TCP `443` 可达且未被其他程序占用。项目运行期间自动续期。
 
-已有 Nginx 等程序占用 `443` 时，使用已有证书，填写 VPS 上证书和私钥的绝对路径。自签证书须由客户端信任，不要跳过证书校验。
+`443` 被其他程序占用时，使用已有证书，填写 VPS 上证书和私钥的绝对路径。自签证书须由客户端信任，不要跳过证书校验。
 
 ### VLESS / Reality
 
@@ -69,7 +62,7 @@ Nginx Proxy Manager 上游可填 `http://172.17.0.1:3100`，启用 HTTPS。地�
 2. 填写此 VPS 的公网 IP 或直连域名，以及兼容 Reality 的目标 SNI（默认 `www.apple.com`），保存。
 3. 点击节点的 **VLESS** 复制公网连接。
 
-无需申请证书。VLESS 行的开关可单独启停，齿轮用于修改参数；停用不会更换端口和凭据。HY2/VLESS 不经过 Nginx 的 HTTP 反代或 Cloudflare 橙云，云安全组须放行实际使用的端口。
+无需申请证书。VLESS 行的开关可单独启停，齿轮用于修改参数；停用不会更换端口和凭据。HY2/VLESS 不经过 HTTP 反代或 Cloudflare 橙云，云安全组须放行实际使用的端口。
 
 ### Docker 使用代理
 
@@ -95,7 +88,7 @@ services:
 | `pph update` | 更新并重启，保留密码和节点 |
 | `pph enable` | 注册服务并开启开机启动 |
 
-旧版没有 `pph` 时，在项目目录执行一次 `sudo bash deploy/update.sh`。`pph stop` 不取消开机启动，`pph` 不管理其他代理或 Nginx 服务。节点和协议变更会重载核心，已有连接可能断开。
+旧版没有 `pph` 时，在项目目录执行一次 `sudo bash deploy/update.sh`。`pph stop` 不取消开机启动，`pph` 不管理其他服务。节点和协议变更会重载核心，已有连接可能断开。
 
 ## 备份与安全
 
@@ -106,6 +99,8 @@ services:
 
 ## Windows
 
-从 [Releases](https://github.com/yinSam612/ProxyPoolHub/releases) 下载 `ProxySocks5Tray.exe` 放到项目根目录，运行后双击托盘图标打开面板。托盘菜单可设置开机启动。
+当前 `ProxySocks5Tray.exe` 是托盘启动器，不是独立版；需要 Node.js 18+、.NET 8 桌面运行时，以及项目的 `server.js`、`src/`、`web/`、`.env.example`。无需编译 C# 源码。
+
+下载项目文件，将 [Releases](https://github.com/yinSam612/ProxyPoolHub/releases) 中的 EXE 放到项目根目录运行。双击托盘图标打开面板，托盘菜单可设置开机启动。
 
 `proxy.bat web` 前台运行，`proxy.bat stop` 停止服务。
