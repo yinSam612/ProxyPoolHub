@@ -16,7 +16,7 @@ const DEFAULT_LOCK_FILE_PATH = path.join(DEFAULT_RUNTIME_DIR, 'proxy-state.lock'
 const DEFAULT_TEST_URL = 'https://www.gstatic.com/generate_204';
 const DEFAULT_INFO_URL = 'http://ip-api.com/json/?fields=status,country,regionName,city,query';
 const FALLBACK_INFO_URLS = ['https://ipwho.is/', 'https://api64.ipify.org', 'https://ifconfig.me/ip'];
-const DEFAULT_SING_BOX_VERSION = '1.13.3';
+const DEFAULT_SING_BOX_VERSION = '1.14.2';
 const DEFAULT_SING_BOX_GITHUB_BASE_URL = 'https://github.com/SagerNet/sing-box/releases/download';
 const DEFAULT_MODULE_CONFIG_PATH = path.join(MODULE_ROOT_DIR, 'proxy-socks5.json');
 
@@ -1103,11 +1103,12 @@ class ProxyManager {
         this.validPorts = [];
         this.lastResults = [];
         this.nodeInfoPromise = null;
-        this.logManager = options.logManager || new LogManager({
-            logDir: path.join(this.moduleConfig.moduleRoot, 'data', 'logs'),
-            trafficFile: path.join(this.moduleConfig.moduleRoot, 'data', 'traffic.json'),
+        this.logManager = options.logManager === false ? null : options.logManager || new LogManager({
+            logDir: options.logDir || path.join(this.moduleConfig.moduleRoot, 'data', 'logs'),
+            trafficFile: options.trafficFile || path.join(this.moduleConfig.moduleRoot, 'data', 'traffic.json'),
             retentionDays: Number(options.retentionDays || process.env.LOG_RETENTION_DAYS || 30),
-            maxTotalMb: Number(options.maxTotalMb || process.env.LOG_MAX_TOTAL_MB || 1024)
+            maxTotalMb: Number(options.maxTotalMb || process.env.LOG_MAX_TOTAL_MB || 50),
+            clearedBefore: options.clearedBefore || 0
         });
     }
 
@@ -1493,9 +1494,14 @@ class ProxyManager {
         this.proxiesCount = this.proxies.length;
         this.validPorts = [];
         const config = this.generateConfig(this.proxies, options.relays || [], options.realityRelays || []);
+        if (this.logManager && !detachProcess) config.services = [await this.logManager.prepareAccounting()];
         fs.writeFileSync(this.configPath, JSON.stringify(config, null, 2), { mode: 0o600 });
         fs.chmodSync(this.configPath, 0o600);
+        this.logManager?.configure(config);
         this.spawnSingBoxProcess(detachProcess);
+        this.logManager?.startAccounting();
+        const proc = this.process;
+        proc.once('exit', () => { if (this.process === proc) this.logManager?.stopAccounting(); });
 
         // 如果明确指定跳过测试，仅需极短等待确认进程启动成功即可快速返回，极大提升 Web 操作响应性
         if (options.skipTest) {
@@ -1701,6 +1707,7 @@ class ProxyManager {
 
     stop(options = {}) {
         const silent = Boolean(options.silent);
+        this.logManager?.stopAccounting();
         if (this.process) {
             try {
                 this.process.kill();

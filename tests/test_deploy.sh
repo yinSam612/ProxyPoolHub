@@ -20,13 +20,16 @@ echo "bash $*" >> "$PPH_TEST_LOG"
 EOF
 chmod +x "$tmp/systemctl" "$tmp/journalctl" "$tmp/bash"
 export PATH="$tmp:$PATH"
-for action in status logs start stop restart enable update; do /bin/bash "$root/deploy/pph.sh" "$action"; done
+for action in status logs start stop restart enable update uninstall; do /bin/bash "$root/deploy/pph.sh" "$action"; done
 grep -q 'systemctl --no-pager status proxypoolhub' "$PPH_TEST_LOG"
 grep -q 'systemctl is-enabled proxypoolhub' "$PPH_TEST_LOG"
 grep -q 'journalctl -u proxypoolhub -n 100 -f' "$PPH_TEST_LOG"
 for action in start stop restart; do grep -q "systemctl $action proxypoolhub" "$PPH_TEST_LOG"; done
 grep -q "bash $root/deploy/service.sh" "$PPH_TEST_LOG"
 grep -q "bash $root/deploy/update.sh" "$PPH_TEST_LOG"
+grep -q "bash $root/deploy/uninstall.sh" "$PPH_TEST_LOG"
+/bin/bash "$root/deploy/pph.sh" uninstall --purge
+grep -q "bash $root/deploy/uninstall.sh --purge" "$PPH_TEST_LOG"
 /bin/bash "$root/deploy/pph.sh" help
 if /bin/bash "$root/deploy/pph.sh" invalid 2>/dev/null; then exit 1; fi
 echo 'Deploy passed: shell syntax and all pph commands (mocked, no real service changes).'

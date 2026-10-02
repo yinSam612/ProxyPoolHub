@@ -9,9 +9,15 @@ const state = {
   port: '',
   keyword: '',
   limit: 100,
+  sort: '',
+  order: 'desc',
+  nodesReady: null,
   autoRefreshMs: 2000,
   timer: null,
   isFetching: false,
+  refreshPending: false,
+  renderedFilter: '',
+  auditGeneration: 0,
   proxies: [],
   currentLogs: []
 };
@@ -24,6 +30,8 @@ const el = {
   limitSelect: document.querySelector('#limitSelect'),
   autoRefreshSelect: document.querySelector('#autoRefreshSelect'),
   refreshBtn: document.querySelector('#refreshBtn'),
+  refreshStatus: document.querySelector('#refreshStatus'),
+  tableWrap: document.querySelector('.logs-table-wrap'),
   exportCsvBtn: document.querySelector('#exportCsvBtn'),
   logsTableBody: document.querySelector('#logsTableBody'),
   matchedCount: document.querySelector('#matchedCount'),
@@ -84,7 +92,7 @@ async function api(url, options = {}) {
   }
   const data = await res.json().catch(() => ({}));
   if (!res.ok) {
-    throw new Error(data.message || `请求失败 (${res.status})`);
+    throw new Error(data.error || data.message || `请求失败 (${res.status})`);
   }
   return data;
 }
@@ -96,7 +104,7 @@ async function loadNodes() {
   try {
     const data = await api('/api/proxies');
     state.proxies = Array.isArray(data) ? data : (data.proxies || []);
-    const currentVal = el.nodeSelect.value;
+    const currentVal = state.port;
     const options = ['<option value="">全部节点 (全部端口)</option>'];
     for (const item of state.proxies) {
       const loc = item.location ? ` [${item.location.split(' / ').slice(-1)[0] || item.location}]` : '';
@@ -105,6 +113,7 @@ async function loadNodes() {
       options.push(`<option value="${item.listenPort}"${currentVal === String(item.listenPort) ? ' selected' : ''}>${escapeHtml(label)}</option>`);
     }
     el.nodeSelect.innerHTML = options.join('');
+    el.nodeSelect.value = state.port;
   } catch (err) {
     console.error('加载节点列表失败:', err);
   }
@@ -113,36 +122,77 @@ async function loadNodes() {
 /**
  * 刷新流量大盘与连接审计日志数据
  */
-async function fetchLogs() {
-  if (state.isFetching) return;
+async function fetchLogs(force = true) {
+  if (state.isFetching) {
+    if (force) state.refreshPending = true;
+    return;
+  }
   state.isFetching = true;
+  el.refreshBtn.setAttribute('aria-busy', 'true');
+  if (force) {
+    el.refreshBtn.classList.add('is-refreshing');
+    el.refreshStatus.textContent = '正在刷新';
+  }
+  const filter = { port: state.port, keyword: state.keyword, limit: state.limit, sort: state.sort, order: state.order };
+  const generation = state.auditGeneration;
+  const stale = () => generation !== state.auditGeneration || Object.keys(filter).some(key => filter[key] !== state[key]);
+  const params = new URLSearchParams();
+  if (filter.port) params.set('port', filter.port);
+  if (filter.keyword) params.set('keyword', filter.keyword);
+  params.set('limit', String(filter.limit));
+  if (filter.sort) {
+    params.set('sort', filter.sort);
+    params.set('order', filter.order);
+  }
+  const filterKey = params.toString();
 
   try {
-    const params = new URLSearchParams();
-    if (state.port) params.set('port', state.port);
-    if (state.keyword) params.set('keyword', state.keyword);
-    params.set('limit', String(state.limit));
-
-    const res = await api(`/api/logs?${params.toString()}`);
+    const res = await api(`/api/logs?${filterKey}`);
+    await state.nodesReady;
+    if (stale()) {
+      state.refreshPending = true;
+      return;
+    }
     const logs = res.logs || [];
     const traffic = res.traffic || {};
     const storage = res.storage || {};
 
-    state.currentLogs = logs;
+    const selection = window.getSelection();
+    const reading = el.tableWrap.scrollTop > 0 || (selection && !selection.isCollapsed && el.logsTableBody.contains(selection.anchorNode));
+    const preserveRows = !force && state.renderedFilter === filterKey && reading;
+    if (preserveRows) {
+      const updates = new Map(logs.map(log => [logKey(log), log]));
+      state.currentLogs = state.currentLogs.map(log => updates.get(logKey(log)) || log);
+    } else {
+      state.currentLogs = logs;
+    }
+    state.renderedFilter = filterKey;
 
     // 1. 渲染指标统计卡片
-    renderMetrics(traffic, storage);
+    renderMetrics(traffic, storage, res.accounting);
 
     // 2. 渲染日志表格
-    renderTable(logs);
+    renderTable(state.currentLogs);
 
     // 3. 更新记录匹配条数
     if (el.matchedCount) {
-      el.matchedCount.textContent = String(logs.length);
+      el.matchedCount.textContent = String(state.currentLogs.length);
     }
+    el.refreshStatus.textContent = `已更新 ${new Date().toLocaleTimeString('zh-CN', { hour12: false })}`;
+    el.refreshStatus.title = '';
   } catch (err) {
+    if (stale()) {
+      state.refreshPending = true;
+      return;
+    }
     console.error('获取日志失败:', err);
-    el.logsTableBody.innerHTML = `
+    el.refreshStatus.textContent = '刷新失败';
+    el.refreshStatus.title = err.message;
+    if (state.renderedFilter !== filterKey) {
+      state.currentLogs = [];
+      el.matchedCount.textContent = '0';
+    }
+    if (!state.currentLogs.length) el.logsTableBody.innerHTML = `
       <tr>
         <td colspan="6" class="logs-error">
           <span class="error-badge">⚠️ 异常</span>
@@ -152,6 +202,12 @@ async function fetchLogs() {
     `;
   } finally {
     state.isFetching = false;
+    el.refreshBtn.setAttribute('aria-busy', 'false');
+    el.refreshBtn.classList.remove('is-refreshing');
+    if (state.refreshPending) {
+      state.refreshPending = false;
+      await fetchLogs();
+    }
   }
 }
 
@@ -160,34 +216,44 @@ async function fetchLogs() {
  * @param {object} traffic - 各端口流量统计对象
  * @param {object} storage - 存储配额与使用详情
  */
-function renderMetrics(traffic, storage) {
+function renderMetrics(traffic, storage, accounting = {}) {
   let totalConns = 0;
   let totalTodayDown = 0;
   let totalTodayUp = 0;
+  let trafficMeasured = accounting.status === 'connected';
+  let partial = false;
 
   // 针对全部节点或指定节点过滤汇总
   for (const [portStr, stat] of Object.entries(traffic)) {
     if (state.port && String(state.port) !== String(portStr)) {
       continue;
     }
-    totalConns += Number(stat.connections || 0);
+    totalConns += Number(stat.todayConnections || 0);
     totalTodayDown += Number(stat.todayDownload || 0);
     totalTodayUp += Number(stat.todayUpload || 0);
+    if (stat.trafficMeasured) trafficMeasured = true;
+    if (stat.trafficPartial || (stat.todayConnections > 0 && !stat.trafficMeasured)) partial = true;
   }
 
   if (el.metricTotalConns) {
-    el.metricTotalConns.textContent = totalConns.toLocaleString();
+    el.metricTotalConns.textContent = totalConns < 1000000 ? totalConns.toLocaleString() : new Intl.NumberFormat('zh-CN', { notation: 'compact', maximumFractionDigits: 1 }).format(totalConns);
+    el.metricTotalConns.title = totalConns.toLocaleString();
   }
   if (el.metricTodayDown) {
-    el.metricTodayDown.textContent = formatBytes(totalTodayDown);
+    el.metricTodayDown.textContent = trafficMeasured ? formatBytes(totalTodayDown) : '未采集';
   }
   if (el.metricTodayUp) {
-    el.metricTodayUp.textContent = formatBytes(totalTodayUp);
+    el.metricTodayUp.textContent = trafficMeasured ? formatBytes(totalTodayUp) : '未采集';
+  }
+  for (const [id, label] of [['metricDownMeta', '下发至客户端数据总量'], ['metricUpMeta', '上行转发至目标站点总量']]) {
+    const meta = document.getElementById(id);
+    meta.textContent = partial && trafficMeasured ? '仅含已采集流量' : label;
+    meta.title = accounting.error || (partial ? '旧连接未采集的流量无法补回' : '');
   }
 
   if (el.metricStorageUsed && storage) {
     const usedMb = (storage.usedBytes || 0) / (1024 * 1024);
-    const maxMb = storage.maxTotalMb || 1024;
+    const maxMb = storage.maxTotalMb || 50;
     const percent = Math.min(100, Math.max(0, (usedMb / maxMb) * 100));
 
     el.metricStorageUsed.textContent = storage.usedFormatted || formatBytes(storage.usedBytes);
@@ -196,9 +262,84 @@ function renderMetrics(traffic, storage) {
       el.storageBarFill.style.backgroundColor = percent > 85 ? 'var(--color-danger)' : (percent > 60 ? 'var(--color-warning)' : 'var(--accent-cyan)');
     }
     if (el.metricStorageMeta) {
-      el.metricStorageMeta.textContent = `最长保留 ${storage.retentionDays || 30} 天 / 配额 ${maxMb} MB (${storage.fileCount || 0} 个切片)`;
+      el.metricStorageMeta.textContent = `${storage.retentionDays || 30} 天 / ${formatBytes(maxMb * 1024 * 1024)} / ${storage.fileCount || 0} 个文件`;
+      el.metricStorageMeta.title = `最长保留 ${storage.retentionDays || 30} 天 / 配额 ${maxMb} MB (${storage.fileCount || 0} 个切片)`;
     }
+    document.querySelector('#storagePolicyNote').textContent = `${storage.retentionDays || 30} 天 / ${maxMb} MB`;
   }
+}
+
+function initLogSettings() {
+  const settings = document.querySelector('#logSettingsDialog');
+  const confirmation = document.querySelector('#clearLogsDialog');
+  const settingsForm = document.querySelector('#logSettingsForm');
+  const clearForm = document.querySelector('#clearLogsForm');
+  const feedback = (id, text, error = false) => {
+    const element = document.getElementById(id);
+    element.textContent = text;
+    element.classList.toggle('error', error);
+  };
+  for (const button of document.querySelectorAll('[data-close]')) {
+    button.addEventListener('click', () => {
+      if (button.dataset.close === 'clearLogsDialog') clearForm.reset();
+      document.getElementById(button.dataset.close).close();
+    });
+  }
+  confirmation.addEventListener('cancel', () => clearForm.reset());
+  confirmation.addEventListener('close', () => clearForm.reset());
+  document.querySelector('#logSettingsBtn').addEventListener('click', async () => {
+    settingsForm.reset();
+    feedback('logSettingsFeedback', '正在读取');
+    settings.showModal();
+    settingsForm.querySelectorAll('input, button').forEach(element => { element.disabled = true; });
+    try {
+      const policy = await api('/api/log-settings');
+      settingsForm.elements.maxTotalMb.value = policy.maxTotalMb;
+      settingsForm.elements.retentionDays.value = policy.retentionDays;
+      document.querySelector('#clearLogsTotpLabel').hidden = !policy.totpEnabled;
+      clearForm.elements.totpCode.required = Boolean(policy.totpEnabled);
+      feedback('logSettingsFeedback', '缩小上限会自动删除最旧记录。');
+    } catch (error) {
+      feedback('logSettingsFeedback', error.message, true);
+    } finally {
+      settingsForm.querySelectorAll('input, button').forEach(element => { element.disabled = false; });
+    }
+  });
+  settingsForm.addEventListener('submit', async event => {
+    event.preventDefault();
+    const submit = settingsForm.querySelector('[type="submit"]');
+    submit.disabled = true;
+    try {
+      await api('/api/log-settings', { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({
+        maxTotalMb: Number(settingsForm.elements.maxTotalMb.value), retentionDays: Number(settingsForm.elements.retentionDays.value)
+      }) });
+      state.auditGeneration++;
+      feedback('logSettingsFeedback', '已保存');
+      await fetchLogs();
+    } catch (error) { feedback('logSettingsFeedback', error.message, true); }
+    finally { submit.disabled = false; }
+  });
+  document.querySelector('#clearLogsBtn').addEventListener('click', () => {
+    settings.close();
+    feedback('clearLogsFeedback', '');
+    confirmation.showModal();
+  });
+  clearForm.addEventListener('submit', async event => {
+    event.preventDefault();
+    const submit = clearForm.querySelector('[type="submit"]');
+    submit.disabled = true;
+    try {
+      await api('/api/logs/clear', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(Object.fromEntries(new FormData(clearForm))) });
+      state.auditGeneration++;
+      state.currentLogs = [];
+      renderTable([]);
+      el.matchedCount.textContent = '0';
+      clearForm.reset();
+      confirmation.close();
+      await fetchLogs();
+    } catch (error) { feedback('clearLogsFeedback', error.message, true); }
+    finally { submit.disabled = false; }
+  });
 }
 
 /**
@@ -207,6 +348,7 @@ function renderMetrics(traffic, storage) {
  */
 function renderTable(logs) {
   if (!logs.length) {
+    if (el.logsTableBody.querySelector('.logs-empty-cell')) return;
     el.logsTableBody.innerHTML = `
       <tr>
         <td colspan="6" class="logs-empty-cell">
@@ -221,7 +363,7 @@ function renderTable(logs) {
     return;
   }
 
-  el.logsTableBody.innerHTML = logs.map((log) => {
+  const html = logs.map((log) => {
     // 时间处理
     let timeStr = '-';
     let fullDate = '';
@@ -232,8 +374,8 @@ function renderTable(logs) {
     }
 
     // 耗时处理
-    let durationText = '< 1ms';
-    if (log.durationMs) {
+    let durationText = '-';
+    if (log.durationMs != null) {
       if (log.durationMs >= 1000) {
         durationText = `${(log.durationMs / 1000).toFixed(1)}s`;
       } else {
@@ -243,20 +385,21 @@ function renderTable(logs) {
 
     // 查找节点名称备注与地理归属
     const hasPort = Boolean(log.listenPort && Number(log.listenPort) > 0);
-    const matchedProxy = hasPort ? state.proxies.find((p) => Number(p.listenPort) === Number(log.listenPort)) : null;
+    const matchedProxy = hasPort ? state.proxies.find((p) => Number(p.listenPort) === Number(log.nodePort || log.listenPort)) : null;
     const locationText = matchedProxy && matchedProxy.location ? matchedProxy.location : '';
     const nodeName = matchedProxy ? (matchedProxy.name || matchedProxy.server || '节点') : '';
-    const displayTag = locationText ? locationText.split(' / ').slice(-1)[0] : (nodeName || '通用节点');
+    const displayTag = nodeName || '未知节点';
     const fullTooltip = locationText ? `${nodeName} · 出口归属: ${locationText}` : (nodeName || '代理节点');
+    const protocol = { mixed: 'HTTP/SOCKS5', hysteria2: 'HY2', vless: 'VLESS' }[log.protocol] || '';
 
     const nodeCellHtml = hasPort
-      ? `<span class="log-port-chip font-mono">:${log.listenPort}</span>
+      ? `<span class="log-port-chip font-mono">${escapeHtml(protocol)} :${log.listenPort}</span>
          <span class="log-node-label" title="${escapeHtml(fullTooltip)}">${escapeHtml(displayTag)}</span>`
       : `<span class="log-direct-chip">系统直连</span>
-         <span class="log-node-label" style="color:var(--text-muted)" title="统一网关/核心直接转发">核心网关</span>`;
+         <span class="log-node-label log-direct-node" title="统一网关/核心直接转发">核心网关</span>`;
 
     return `
-      <tr class="log-row">
+      <tr class="log-row" data-log-id="${escapeHtml(logKey(log))}">
         <td title="${escapeHtml(fullDate)}">
           <span class="log-time-chip font-mono">${escapeHtml(timeStr)}</span>
         </td>
@@ -266,23 +409,47 @@ function renderTable(logs) {
           </div>
         </td>
         <td>
-          <span class="log-client-pill font-mono" title="客户端来源 IP 及端口">${escapeHtml(log.client || '-')}</span>
+          <span class="log-client-pill font-mono" title="${escapeHtml(log.client || '-')}">${escapeHtml(log.client || '-')}</span>
         </td>
         <td>
           <span class="log-target-cell font-mono" title="${escapeHtml(log.target || '-')}">${escapeHtml(log.target || '-')}</span>
         </td>
         <td>
           <div class="log-traffic-group font-mono">
-            <span class="up" title="上行请求数据量">↑ ${escapeHtml(log.uploadFormatted || '0 B')}</span>
-            <span class="down" title="下行响应数据量">↓ ${escapeHtml(log.downloadFormatted || '0 B')}</span>
+            <span class="up" title="上行: ${escapeHtml(log.uploadFormatted || '未采集')}">↑ ${escapeHtml(log.uploadFormatted || '-')}</span>
+            <span class="down" title="下行: ${escapeHtml(log.downloadFormatted || '未采集')}">↓ ${escapeHtml(log.downloadFormatted || '-')}</span>
           </div>
         </td>
         <td>
-          <span class="log-duration-tag font-mono">${durationText}</span>
+          <span class="log-duration-tag font-mono" title="${escapeHtml(durationText)}">${escapeHtml(durationText)}</span>
         </td>
       </tr>
     `;
   }).join('');
+  const template = document.createElement('template');
+  template.innerHTML = `<table><tbody>${html}</tbody></table>`;
+  const existing = new Map([...el.logsTableBody.querySelectorAll('.log-row')].map(row => [row.dataset.logId, row]));
+  const keep = new Set();
+  const scrollTop = el.tableWrap.scrollTop;
+  const scrollLeft = el.tableWrap.scrollLeft;
+  for (const [index, fresh] of [...template.content.querySelector('tbody').children].entries()) {
+    const id = fresh.dataset.logId;
+    keep.add(id);
+    let row = existing.get(id);
+    if (row) {
+      for (let i = 0; i < fresh.children.length; i++) {
+        if (!row.children[i].isEqualNode(fresh.children[i])) row.children[i].replaceWith(fresh.children[i].cloneNode(true));
+      }
+    } else row = fresh;
+    if (el.logsTableBody.children[index] !== row) el.logsTableBody.insertBefore(row, el.logsTableBody.children[index] || null);
+  }
+  for (const row of [...el.logsTableBody.children]) if (!keep.has(row.dataset.logId)) row.remove();
+  el.tableWrap.scrollTop = scrollTop;
+  el.tableWrap.scrollLeft = scrollLeft;
+}
+
+function logKey(log) {
+  return log.id || `${log.timestamp}|${log.listenPort}|${log.protocol}|${log.client}|${log.target}`;
 }
 
 /**
@@ -300,9 +467,9 @@ function exportCsv() {
     `"${log.listenPort || ''}"`,
     `"${log.client || ''}"`,
     `"${(log.target || '').replace(/"/g, '""')}"`,
-    `"${log.uploadFormatted || '0 B'}"`,
-    `"${log.downloadFormatted || '0 B'}"`,
-    `"${log.durationMs || 0}"`
+    `"${log.uploadFormatted || ''}"`,
+    `"${log.downloadFormatted || ''}"`,
+    `"${log.durationMs ?? ''}"`
   ]);
 
   const csvContent = '\uFEFF' + [headers.join(','), ...rows.map((r) => r.join(','))].join('\r\n');
@@ -327,7 +494,7 @@ function resetPolling() {
     state.timer = null;
   }
   if (state.autoRefreshMs > 0) {
-    state.timer = setInterval(fetchLogs, state.autoRefreshMs);
+    state.timer = setInterval(() => fetchLogs(false), state.autoRefreshMs);
     if (el.liveBadge) {
       el.liveBadge.innerHTML = '<span class="status-dot online"></span> 实时监听';
       el.liveBadge.className = 'brand-version pulse-badge';
@@ -344,6 +511,26 @@ function resetPolling() {
  * 事件绑定与初始化入口
  */
 function initEvents() {
+  for (const button of document.querySelectorAll('[data-sort]')) {
+    button.addEventListener('click', () => {
+      state.order = state.sort === button.dataset.sort && state.order === 'desc' ? 'asc' : 'desc';
+      state.sort = button.dataset.sort;
+      for (const control of document.querySelectorAll('[data-sort]')) {
+        const selected = state.sort === control.dataset.sort;
+        const next = selected && state.order === 'desc' ? '从小到大' : '从大到小';
+        control.setAttribute('aria-pressed', String(selected));
+        control.setAttribute('aria-label', `${control.dataset.label}：${next}排序`);
+        control.title = `${control.dataset.label}：${next}排序`;
+        control.querySelector('use').setAttribute('href', `/lucide.svg#${selected ? (state.order === 'desc' ? 'arrow-down' : 'arrow-up') : 'arrow-up-down'}`);
+      }
+      for (const header of el.logsTableBody.closest('table').querySelectorAll('th:has([data-sort])')) {
+        const active = header.querySelector('[aria-pressed="true"]');
+        header.setAttribute('aria-sort', active ? (state.order === 'asc' ? 'ascending' : 'descending') : 'none');
+      }
+      fetchLogs();
+    });
+  }
+
   // 节点选择变更
   el.nodeSelect.addEventListener('change', (e) => {
     state.port = e.target.value;
@@ -398,6 +585,7 @@ function initEvents() {
 // 启动逻辑
 (async function bootstrap() {
   initEvents();
+  initLogSettings();
 
   // 读取 URL 参数预设筛选条件
   const urlParams = new URLSearchParams(window.location.search);
@@ -409,11 +597,7 @@ function initEvents() {
     if (el.searchInput) el.searchInput.value = state.keyword;
   }
 
-  await loadNodes();
-  if (state.port && el.nodeSelect) {
-    el.nodeSelect.value = state.port;
-  }
-
+  state.nodesReady = loadNodes();
   await fetchLogs();
   resetPolling();
 })();

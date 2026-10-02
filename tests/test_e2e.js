@@ -17,15 +17,17 @@ const totp = require('../src/utils/totp');
 
 const path = require('path');
 const fs = require('fs');
+const { gunzipSync } = require('zlib');
 const TEST_PORT = 3199;
 const ADMIN_USER = 'testadmin';
 const ADMIN_PASS = 'testpassword123';
-const TEMP_DATA_FILE = path.join(__dirname, 'temp_e2e_data.json');
+const TEMP_RUNTIME_DIR = path.join(__dirname, 'temp_e2e_runtime');
+const TEMP_DATA_FILE = path.join(TEMP_RUNTIME_DIR, 'temp_e2e_data.json');
 const TEMP_CERT_FILE = path.join(__dirname, 'temp_e2e_cert.pem');
 const TEMP_KEY_FILE = path.join(__dirname, 'temp_e2e_key.pem');
-const TEMP_RUNTIME_DIR = path.join(__dirname, 'temp_e2e_runtime');
 
 // 初始化干净的测试数据文件，避免和用户本地运行中的 40000 端口冲突
+fs.mkdirSync(TEMP_RUNTIME_DIR, { recursive: true });
 fs.writeFileSync(TEMP_DATA_FILE, JSON.stringify({
     version: 1,
     settings: { hy2Host: 'relay.example.test' },
@@ -60,13 +62,15 @@ function request(options, postData = '') {
             port: TEST_PORT,
             ...options
         }, (res) => {
-            let data = '';
-            res.on('data', (chunk) => data += chunk);
+            const chunks = [];
+            res.on('data', chunk => chunks.push(chunk));
             res.on('end', () => {
+                const data = Buffer.concat(chunks);
                 resolve({
                     status: res.statusCode,
                     headers: res.headers,
-                    body: data
+                    body: data.toString(),
+                    rawBody: data
                 });
             });
         });
@@ -172,12 +176,88 @@ async function run() {
         const statusData = JSON.parse(statusRes.body);
         assert.strictEqual(statusData.service, 'running');
         console.log('✓ 4. 鉴权访问 /api/status 成功');
+        assert.strictEqual(statusRes.headers['cache-control'], 'no-store');
+        for (const asset of ['/app.js', '/logs.js', '/style.css', '/lucide.svg']) {
+            const headers = { Cookie: sessionCookie, 'Accept-Encoding': 'gzip' };
+            const compressed = await request({ path: asset, headers });
+            assert.strictEqual(compressed.status, 200);
+            assert.strictEqual(compressed.headers['content-encoding'], 'gzip');
+            assert.strictEqual(compressed.headers.vary, 'Accept-Encoding');
+            assert.strictEqual(compressed.headers['cache-control'], 'private, max-age=0, must-revalidate');
+            assert.ok(gunzipSync(compressed.rawBody).equals(fs.readFileSync(path.join(__dirname, '..', 'web', asset.slice(1)))));
+            assert.ok(compressed.rawBody.length < gunzipSync(compressed.rawBody).length);
+            const cached = await request({ path: asset, headers: { ...headers, 'If-None-Match': compressed.headers.etag } });
+            assert.strictEqual(cached.status, 304);
+            assert.strictEqual(cached.body, '');
+            const fresh = await request({ path: asset, headers: { ...headers, 'If-None-Match': 'W/"old-version"', 'Accept-Encoding': 'gzip;q=0, *;q=1' } });
+            assert.strictEqual(fresh.status, 200, 'Stale assets must be replaced');
+            assert.strictEqual(fresh.headers['content-encoding'], undefined, 'Explicit gzip;q=0 must override wildcard');
+            if (asset !== '/style.css') {
+                const unauthorized = await request({ path: asset, headers: { 'If-None-Match': compressed.headers.etag } });
+                assert.strictEqual(unauthorized.status, 303, 'A cached asset must not bypass login');
+            }
+        }
+        for (const page of ['/', '/logs', '/login']) {
+            const html = await request({ path: page, headers: { Cookie: sessionCookie, 'If-None-Match': '*' } });
+            assert.strictEqual(html.headers['cache-control'], 'no-store', 'HTML/login must not cache authenticated page state');
+            assert.notStrictEqual(html.status, 304);
+        }
+        for (const query of ['sort=invalid', 'sort=downloadBytes&order=invalid']) {
+            const invalid = await request({ path: `/api/logs?${query}`, headers: { Cookie: sessionCookie } });
+            assert.strictEqual(invalid.status, 400);
+        }
+        console.log('✓ Static gzip, ETag revalidation, fresh versions, authentication and log sort validation');
         const accessSettings = JSON.parse((await request({ path: '/api/settings', headers: { Cookie: sessionCookie } })).body);
         assert.strictEqual(accessSettings.proxyAccess.publicTcp, 'blocked', 'loopback-bound proxies must not advertise public access');
         const invalidProxy = await request({ port: 41999, path: 'http://api.ipify.org/', headers: { Host: 'api.ipify.org', 'Proxy-Authorization': `Basic ${Buffer.from('wrong:proxypassword').toString('base64')}` } });
         assert.strictEqual(invalidProxy.status, 407);
         await sleep(50);
         assert.ok(capturedStderr.includes('password=[redacted]') && !capturedStderr.includes('password=proxypassword'), '真实内核认证失败日志必须脱敏');
+
+        const auditTarget = http.createServer((req, res) => res.end('audit-proxy-ok'));
+        await new Promise(resolve => auditTarget.listen(0, '127.0.0.1', resolve));
+        try {
+            const target = `127.0.0.1:${auditTarget.address().port}`;
+            const proxyRes = await request({ port: 41999, path: `http://${target}/audit-test`, headers: {
+                Host: target, 'Proxy-Authorization': `Basic ${Buffer.from('proxy:proxypassword').toString('base64')}`
+            } });
+            assert.strictEqual(proxyRes.body, 'audit-proxy-ok', 'Send a real authenticated request through sing-box');
+            let audit;
+            for (let i = 0; i < 20; i++) {
+                audit = JSON.parse((await request({ path: `/api/logs?port=41999&keyword=${encodeURIComponent(target)}`, headers: { Cookie: sessionCookie } })).body);
+                if (audit.logs.some(item => item.uploadBytes > 0 && item.downloadBytes > 0 && item.status === 'closed')) break;
+                await sleep(50);
+            }
+            assert.ok(audit.logs.length, 'Real core connections must appear in the filtered audit API without waiting for a close event');
+            assert.strictEqual(audit.logs[0].listenPort, 41999);
+            assert.strictEqual(audit.logs[0].protocol, 'mixed');
+            assert.strictEqual(audit.logs[0].target, target);
+            assert.ok(audit.logs[0].client.startsWith('127.0.0.1:'));
+            assert.ok(audit.traffic[41999].todayConnections > 0);
+            assert.ok(audit.logs[0].uploadBytes > 0 && audit.logs[0].downloadBytes > 0, 'The API must expose actual core byte totals');
+            assert.strictEqual(audit.accounting.status, 'connected');
+            const pageReload = JSON.parse((await request({ path: `/api/logs?port=41999&keyword=${encodeURIComponent(target)}`, headers: { Cookie: sessionCookie } })).body);
+            assert.strictEqual(pageReload.logs[0].id, audit.logs[0].id);
+            console.log('✓ Real sing-box connection -> persisted audit -> node-filtered API -> page reload');
+        } finally { await new Promise(resolve => auditTarget.close(resolve)); }
+
+        const logHeaders = { Cookie: sessionCookie, 'Content-Type': 'application/json' };
+        const logApi = (path, method = 'GET', body, headers = logHeaders) => request({ path, method, headers }, body ? JSON.stringify(body) : '');
+        assert.strictEqual(JSON.parse((await logApi('/api/log-settings')).body).maxTotalMb, 50);
+        assert.strictEqual((await logApi('/api/log-settings', 'PUT', { maxTotalMb: 0, retentionDays: 7 })).status, 400);
+        const configBeforeLogs = fs.readFileSync(path.join(TEMP_RUNTIME_DIR, 'temp_singbox_config.json'), 'utf8');
+        assert.strictEqual((await logApi('/api/log-settings', 'PUT', { maxTotalMb: 1, retentionDays: 7 })).status, 200);
+        assert.deepStrictEqual(JSON.parse(fs.readFileSync(TEMP_DATA_FILE)).settings.logStorage, { maxTotalMb: 1, retentionDays: 7 });
+        assert.strictEqual(JSON.parse((await logApi('/api/log-settings')).body).maxTotalMb, 1);
+        const trafficBeforeClear = JSON.parse((await logApi('/api/traffic')).body).traffic;
+        assert.strictEqual((await logApi('/api/logs/clear', 'POST', { currentPassword: ADMIN_PASS }, {})).status, 401);
+        assert.strictEqual((await logApi('/api/logs/clear', 'POST', { currentPassword: 'wrong' })).status, 403);
+        assert.strictEqual((await logApi('/api/logs/clear', 'POST', { currentPassword: ADMIN_PASS })).status, 200);
+        assert.deepStrictEqual(JSON.parse((await logApi('/api/logs')).body).logs, []);
+        assert.deepStrictEqual(JSON.parse((await logApi('/api/traffic')).body).traffic, trafficBeforeClear);
+        assert.ok(JSON.parse(fs.readFileSync(TEMP_DATA_FILE)).settings.logsClearedBefore > 0);
+        assert.strictEqual(fs.readFileSync(path.join(TEMP_RUNTIME_DIR, 'temp_singbox_config.json'), 'utf8'), configBeforeLogs, 'Log settings and clearing must not restart or reconfigure the core');
+        console.log('PASS: Authenticated storage API, persistent quota, reauthenticated clear retaining traffic and running core');
 
         // 5. 获取 TOTP 配置信息
         const totpSetupRes = await request({
@@ -189,6 +269,14 @@ async function run() {
         const totpSetupData = JSON.parse(totpSetupRes.body);
         assert.strictEqual(Boolean(totpSetupData.secret), true);
         assert.strictEqual(totpSetupData.otpauthUrl.includes('otpauth://totp/'), true);
+        const expectedIssuer = `ProxyPH-${os.hostname()}`;
+        assert.strictEqual(totpSetupData.issuer, expectedIssuer);
+        assert.strictEqual(totpSetupData.account, ADMIN_USER);
+        const setupUrl = new URL(totpSetupData.otpauthUrl);
+        assert.strictEqual(decodeURIComponent(setupUrl.pathname), `/${expectedIssuer}:${ADMIN_USER}`);
+        assert.strictEqual(setupUrl.searchParams.get('issuer'), expectedIssuer);
+        const repeatedSetup = JSON.parse((await request({ path: '/api/totp/setup', headers: { Cookie: sessionCookie } })).body);
+        assert.strictEqual(repeatedSetup.secret, totpSetupData.secret, 'Label changes must not rotate a pending binding secret');
         console.log('✓ 5. 获取 TOTP Secret 成功:', totpSetupData.secret);
 
         // 6. 绑定 TOTP（动态验证码校验）
@@ -239,6 +327,7 @@ async function run() {
         const enabledSetup = JSON.parse((await request({ path: '/api/totp/setup', headers: { Cookie: totpSessionCookie } })).body);
         assert.strictEqual(enabledSetup.secret, undefined, '已启用的 TOTP 密钥不能再次读取');
         assert.strictEqual((await request({ path: '/api/totp/disable', method: 'POST', headers: { Cookie: totpSessionCookie, 'Content-Type': 'application/json' } }, JSON.stringify({ currentPassword: ADMIN_PASS }))).status, 403);
+        assert.strictEqual((await request({ path: '/api/logs/clear', method: 'POST', headers: { Cookie: totpSessionCookie, 'Content-Type': 'application/json' } }, JSON.stringify({ currentPassword: ADMIN_PASS }))).status, 403, 'Clear must require TOTP when enabled');
         const disabledTotp = await request({ path: '/api/totp/disable', method: 'POST', headers: { Cookie: totpSessionCookie, 'Content-Type': 'application/json' } }, JSON.stringify({ currentPassword: ADMIN_PASS, totpCode: newTotpCode }));
         assert.strictEqual(disabledTotp.status, 200);
         assert.strictEqual((await request({ path: '/api/status', headers: { Cookie: totpSessionCookie } })).status, 401);
@@ -540,7 +629,9 @@ async function run() {
         for (const file of [TEMP_DATA_FILE, TEMP_CERT_FILE, TEMP_KEY_FILE]) {
             try { fs.unlinkSync(file); } catch (e) {}
         }
-        try { fs.unlinkSync(path.join(TEMP_RUNTIME_DIR, 'temp_singbox_config.json')); fs.rmdirSync(TEMP_RUNTIME_DIR); } catch (e) {}
+        const resolved = path.resolve(TEMP_RUNTIME_DIR);
+        assert.strictEqual(path.dirname(resolved), path.resolve(__dirname));
+        try { fs.rmSync(resolved, { recursive: true, force: true }); } catch (e) {}
     }
 }
 

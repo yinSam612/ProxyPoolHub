@@ -35,6 +35,26 @@ generate_random_password() {
     fi
 }
 
+configure_admin_user() {
+    local app_dir existing_user
+    app_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+    existing_user=$(sed -n 's/\r$//; s/^[[:space:]]*ADMIN_USER[[:space:]]*=[[:space:]]*//p' "$app_dir/.env" 2>/dev/null | head -1)
+    if [[ "$existing_user" == \"*\" || "$existing_user" == \'*\' ]]; then existing_user="${existing_user:1:${#existing_user}-2}"; fi
+    if [ -n "$existing_user" ]; then
+        echo "保留已有管理员账号: $existing_user"
+        return
+    fi
+    install_admin_user="${ADMIN_USER:-}"
+    while ! [[ "$install_admin_user" =~ ^[a-zA-Z0-9][a-zA-Z0-9_.-]{2,31}$ ]]; do
+        echo '请设置管理员用户名（3-32 位字母、数字、点、下划线或横线，首位为字母或数字）。'
+        if ! read -r -p '管理员用户名: ' install_admin_user; then
+            echo '未设置用户名；非交互安装请使用 ADMIN_USER=你的用户名 bash deploy/install.sh。' >&2
+            exit 1
+        fi
+    done
+    echo "管理员账号: $install_admin_user"
+}
+
 # 函数: 检测并安装基础工具
 install_base_tools() {
     echo -e "${YELLOW}[1/6] 检查系统基础工具...${NC}"
@@ -101,14 +121,16 @@ install_dependencies() {
         local rand_proxy_pass
         rand_proxy_pass=$(generate_random_password)
 
-        sed -i "s/^ADMIN_PASSWORD=.*/ADMIN_PASSWORD=${rand_admin_pass}/" .env 2>/dev/null || echo "ADMIN_PASSWORD=${rand_admin_pass}" >> .env
-        sed -i "s/^PROXY_PASSWORD=.*/PROXY_PASSWORD=${rand_proxy_pass}/" .env 2>/dev/null || echo "PROXY_PASSWORD=${rand_proxy_pass}" >> .env
-        sed -i "s/^WEB_PORT=.*/WEB_PORT=3100/" .env 2>/dev/null || echo "WEB_PORT=3100" >> .env
-        sed -i "s/^PROXY_LISTEN_ADDRESS=.*/PROXY_LISTEN_ADDRESS=0.0.0.0/" .env 2>/dev/null || echo "PROXY_LISTEN_ADDRESS=0.0.0.0" >> .env
+        sed -i '/^ADMIN_PASSWORD=/d; /^PROXY_PASSWORD=/d; /^WEB_PORT=/d; /^PROXY_LISTEN_ADDRESS=/d' .env
+        printf '\nADMIN_PASSWORD=%s\nPROXY_PASSWORD=%s\nWEB_PORT=3100\nPROXY_LISTEN_ADDRESS=0.0.0.0\n' "$rand_admin_pass" "$rand_proxy_pass" >> .env
         chmod 600 .env
         echo -e "${GREEN}✓ 已自动生成随机安全管理员密码并保存到 .env${NC}"
     fi
-    sed -i '/^MANAGE_FIREWALL=/d; /^REQUIRE_AUTH=/d' .env
+    if [ -n "${install_admin_user:-}" ]; then
+        sed -i '/^[[:space:]]*ADMIN_USER[[:space:]]*=/d' .env
+        printf '\nADMIN_USER=%s\n' "$install_admin_user" >> .env
+    fi
+    sed -i 's/\r$//; /^MANAGE_FIREWALL=/d; /^REQUIRE_AUTH=/d' .env
     printf '\nMANAGE_FIREWALL=true\nREQUIRE_AUTH=true\n' >> .env
     chmod 600 .env
 
@@ -173,6 +195,7 @@ configure_firewall() {
 
 # 执行各阶段
 check_privileges
+configure_admin_user
 install_base_tools
 check_nodejs
 install_dependencies
@@ -206,6 +229,7 @@ echo -e "===================================================="
 echo -e "服务状态查看:   ${YELLOW}pph${NC}"
 echo -e "服务实时日志:   ${YELLOW}pph logs${NC}"
 echo -e "重启 / 更新:    ${YELLOW}pph restart / pph update${NC}"
+echo -e "卸载服务:       ${YELLOW}pph uninstall（保留配置）${NC}"
 echo -e "Reality 端口:   ${BLUE}50000-50100/TCP，按节点开启${NC}"
 echo -e "配置文件路径:   ${BLUE}${app_dir}/.env${NC}"
 echo -e "访问控制:       ${BLUE}HTTP/SOCKS5 仅本机与 Docker；HY2/VLESS 按启用状态开放${NC}"

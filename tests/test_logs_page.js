@@ -15,7 +15,8 @@ const tmpDir = path.join(__dirname, '..', 'data', 'test_storage_logs');
 if (!fs.existsSync(tmpDir)) fs.mkdirSync(tmpDir, { recursive: true });
 fs.writeFileSync(path.join(tmpDir, 'access-2026-09-20.log'), 'test line 1\ntest line 2\n');
 
-const lm = new LogManager({ logDir: tmpDir, retentionDays: 30, maxTotalMb: 1024 });
+const trafficFile = path.join(tmpDir, 'traffic.json');
+const lm = new LogManager({ logDir: tmpDir, trafficFile, retentionDays: 30, maxTotalMb: 1024 });
 const info = lm.getStorageInfo();
 assert.strictEqual(info.retentionDays, 30);
 assert.strictEqual(info.maxTotalMb, 1024);
@@ -27,6 +28,7 @@ lm.destroy();
 // 清理临时文件
 try {
     fs.unlinkSync(path.join(tmpDir, 'access-2026-09-20.log'));
+    fs.unlinkSync(trafficFile);
     fs.rmdirSync(tmpDir);
 } catch (e) {}
 

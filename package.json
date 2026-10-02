@@ -6,8 +6,8 @@
   "scripts": {
     "start": "node server.js",
     "web": "node server.js",
-    "test:web": "node tests/test_web.js && node tests/test_web_security.js && node tests/test_web_ui.js",
-    "test": "node --check server.js && node --check src/core/proxy-manager.js && node --check web/app.js && node tests/test_security.js && node tests/test_log_manager.js && node tests/test_logs_page.js && node tests/test_subscription.js && node tests/test_relay.js && node tests/test_reality.js && node tests/test_totp.js && node tests/test_e2e.js"
+    "test:web": "node tests/test_web.js && node tests/test_web_security.js && node tests/test_web_ui.js && node tests/test_web_logs.js && node tests/test_web_navigation.js",
+    "test": "node --check server.js && node --check src/core/proxy-manager.js && node --check web/app.js && node --check web/logs.js && node tests/test_security.js && node tests/test_log_manager.js && node tests/test_log_storage.js && node tests/test_logs_page.js && node tests/test_subscription.js && node tests/test_relay.js && node tests/test_reality.js && node tests/test_totp.js && node tests/test_e2e.js"
   },
   "keywords": [
     "proxy-pool",
@@ -24,5 +24,8 @@
   "engines": {
     "node": ">=18.0.0"
   },
-  "dependencies": {}
+  "dependencies": {
+    "@grpc/grpc-js": "1.14.5",
+    "@grpc/proto-loader": "0.8.1"
+  }
 }
