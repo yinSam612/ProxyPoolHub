@@ -1,7 +1,7 @@
 /**
  * @file app.js
  * @description Relay Control Web 前端核心交互逻辑
- * 支持局部快速更新、后台智能感知自动轮询、扩大复选框热区、及标准 SVG Google 身份验证器 (TOTP)
+ * 节点选择、状态同步、代理复制及身份验证管理
  */
 
 // DOM 元素引用
@@ -11,12 +11,18 @@ const addForm = document.querySelector('#addForm');
 const importForm = document.querySelector('#importForm');
 const editForm = document.querySelector('#editForm');
 const settingsForm = document.querySelector('#settingsForm');
+const relayTlsForm = document.querySelector('#relayTlsForm');
+const realityForm = document.querySelector('#realityForm');
+const passwordForm = document.querySelector('#passwordForm');
 const totpBindForm = document.querySelector('#totpBindForm');
 
 const addDialog = document.querySelector('#addDialog');
 const importDialog = document.querySelector('#importDialog');
 const editDialog = document.querySelector('#editDialog');
 const settingsDialog = document.querySelector('#settingsDialog');
+const relayDialog = document.querySelector('#relayDialog');
+const realityDialog = document.querySelector('#realityDialog');
+const passwordDialog = document.querySelector('#passwordDialog');
 const totpDialog = document.querySelector('#totpDialog');
 const confirmDialog = document.querySelector('#confirmDialog');
 
@@ -29,7 +35,17 @@ let items = [];
 let toastTimer = null;
 let currentTotpSetup = null;
 let autoPollerTimer = null;
+let refreshPromise = null;
+let serviceStatus = null;
+let manualHealthCheck = false;
+const selectedNodeIds = new Set();
+const autoRefresh = document.querySelector('#autoRefresh');
 const INTERNAL_PROXY_HOST = '127.0.0.1';
+const DOCKER_PROXY_HOST = 'host';
+
+function icon(name) {
+  return `<svg class="tool-icon" aria-hidden="true"><use href="/lucide.svg#${name}"></use></svg>`;
+}
 
 /**
  * 弹出高质感异步确认对话框，取代原生 confirm()
@@ -133,17 +149,25 @@ function showMessage(text, error = false, duration = 3500) {
  */
 async function copyText(text) {
   if (navigator.clipboard && window.isSecureContext) {
-    await navigator.clipboard.writeText(text);
-    return;
+    try {
+      await navigator.clipboard.writeText(text);
+      return;
+    } catch (error) { /* use the focused fallback below */ }
   }
+  const focused = document.activeElement;
   const textarea = document.createElement('textarea');
   textarea.value = text;
   textarea.style.position = 'fixed';
   textarea.style.opacity = '0';
-  document.body.appendChild(textarea);
-  textarea.select();
-  document.execCommand('copy');
-  textarea.remove();
+  (focused?.closest('dialog[open]') || document.body).appendChild(textarea);
+  try {
+    textarea.focus();
+    textarea.select();
+    if (!document.execCommand('copy')) throw new Error('复制失败，请检查浏览器剪贴板权限');
+  } finally {
+    textarea.remove();
+    focused?.focus();
+  }
 }
 
 /**
@@ -172,10 +196,7 @@ async function api(url, options = {}) {
  * @returns {Set<string>} 选中的节点 ID 集合
  */
 function selectedIds() {
-  return new Set(
-    Array.from(document.querySelectorAll('.row-select:checked'))
-      .map((checkbox) => checkbox.dataset.id)
-  );
+  return new Set(selectedNodeIds);
 }
 
 /**
@@ -191,15 +212,25 @@ function updateSelectionText() {
   const batchDeleteBtn = document.querySelector('#batchDelete');
   const batchDeleteDivider = document.querySelector('#batchDeleteDivider');
   const batchDeleteText = document.querySelector('#batchDeleteText');
+  const deletableCount = getSelectedItems().filter((item) => !item.isLocal).length;
   if (batchDeleteBtn) {
-    batchDeleteBtn.style.display = count > 0 ? 'inline-flex' : 'none';
+    batchDeleteBtn.style.display = deletableCount > 0 ? 'inline-flex' : 'none';
     if (batchDeleteText) {
-      batchDeleteText.textContent = `批量删除 (${count})`;
+      batchDeleteText.textContent = `批量删除 (${deletableCount})`;
     }
   }
   if (batchDeleteDivider) {
-    batchDeleteDivider.style.display = count > 0 ? 'inline-block' : 'none';
+    batchDeleteDivider.style.display = deletableCount > 0 ? 'inline-block' : 'none';
   }
+  const visible = Array.from(rows.querySelectorAll('.row-select'));
+  const checkedCount = visible.filter((checkbox) => selectedNodeIds.has(checkbox.dataset.id)).length;
+  selectAll.checked = visible.length > 0 && checkedCount === visible.length;
+  selectAll.indeterminate = checkedCount > 0 && checkedCount < visible.length;
+  selectAll.disabled = visible.length === 0;
+  const mobileSelectAll = document.querySelector('#mobileSelectAll');
+  mobileSelectAll.checked = selectAll.checked;
+  mobileSelectAll.indeterminate = selectAll.indeterminate;
+  mobileSelectAll.disabled = selectAll.disabled;
 }
 
 /**
@@ -233,33 +264,29 @@ function renderTrafficMiniTag(traffic) {
  */
 function renderRowHtml(item, isChecked) {
   const name = escapeHtml(item.name || item.server);
-  const status = item.status === 'online'
-    ? '在线'
-    : item.status === 'offline'
-      ? '离线'
-      : item.status === 'disabled'
-        ? '已禁用'
-        : '检测中';
-
-  const toggleAction = item.enabled
-    ? `<button class="btn-action danger" data-action="disable" data-id="${item.id}" title="禁用此节点并释放转发">禁用</button>`
-    : `<button class="btn-action success" data-action="enable" data-id="${item.id}" title="启用此节点">启用</button>`;
-
-  const checked = isChecked && item.enabled ? ' checked' : '';
+  const state = !item.enabled ? 'disabled' : serviceStatus?.core === 'stopped' ? 'stopped' : item.status;
+  const status = { online: '可达', offline: '不可达', disabled: '已禁用', stopped: '核心停止', testing: '检测中' }[state] || '未检测';
+  const checked = isChecked ? ' checked' : '';
   const disabled = item.enabled ? '' : ' disabled';
-  const statusTitle = escapeHtml(item.lastError || item.lastCheckedAt || status);
+  const coreDisabled = !item.enabled || serviceStatus?.core === 'stopped' ? ' disabled' : '';
+  const hy2Configured = item.hy2?.status === 'enabled';
+  const hy2Enabled = hy2Configured && serviceStatus?.core !== 'stopped';
+  const realityConfigured = Boolean(item.reality?.enabled);
+  const realityEnabled = realityConfigured && item.enabled && serviceStatus?.core !== 'stopped';
+  const checkedTime = item.lastCheckedAt ? new Date(item.lastCheckedAt).toLocaleTimeString('zh-CN', { hour12: false }) : '未检测';
+  const statusTitle = escapeHtml([item.lastError, item.lastCheckedAt && `检测时间 ${new Date(item.lastCheckedAt).toLocaleString('zh-CN')}`, '本机 SOCKS5 / TLS 探测，不代表外部 HY2/VLESS 可达'].filter(Boolean).join('\n'));
 
   return `
     <tr class="node-row ${item.enabled ? '' : 'disabled-row'}" id="row-${item.id}" data-id="${item.id}">
       <td class="col-select">
         <label class="checkbox-hitbox" title="选择节点 ${name}">
-          <input class="row-select" type="checkbox" data-id="${item.id}" aria-label="选择 ${name}"${checked}${disabled}>
+          <input class="row-select" type="checkbox" data-id="${item.id}" aria-label="选择 ${name}"${checked}>
         </label>
       </td>
       <td class="col-node">
         <div class="node-title-cell">
           <strong class="node-name" title="${name}">${name}</strong>
-          <span class="node-target font-mono">${escapeHtml(item.server)}:${item.upstreamPort}</span>
+          <span class="node-target font-mono">${item.isLocal ? '自身 VPS · 直连' : `${escapeHtml(item.server)}:${item.upstreamPort}`}</span>
         </div>
       </td>
       <td class="col-proto">
@@ -275,23 +302,41 @@ function renderRowHtml(item, isChecked) {
         <span class="latency-val ${latencyClass(item.latencyMs)}">${item.latencyMs ? `${item.latencyMs} ms` : '—'}</span>
       </td>
       <td class="col-port">
-        <span class="port-chip font-mono">${item.listenPort}</span>
+        <span class="port-chip font-mono${coreDisabled ? ' port-inactive' : ''}" title="HTTP / SOCKS5 · 本机、Docker 或公网 · ${coreDisabled ? '未监听' : '已启用'}">TCP ${item.listenPort}</span>
+        <span class="port-chip hy2-port-chip font-mono${hy2Enabled ? '' : ' port-inactive'}" title="HY2 · 外部使用 · UDP · ${hy2Enabled ? '已启用，公网 UDP 尚未检测' : hy2Configured ? '已配置，但核心已停止' : '未启用'}">${hy2Configured ? `HY2 ${item.listenPort}${hy2Enabled ? '' : ' 停止'}` : 'HY2 未启用'}</span>
+        ${item.reality ? `<span class="port-chip reality-port-chip font-mono${realityEnabled ? '' : ' port-inactive'}" title="VLESS + RAW + Reality · 外部使用 · TCP">VLESS ${item.reality.listenPort}${realityEnabled ? '' : ' 停止'}</span>` : ''}
         ${renderTrafficMiniTag(item.traffic)}
       </td>
       <td class="col-status">
-        <span class="status-chip ${item.status}" title="${statusTitle}">
+        <span class="status-chip ${escapeHtml(state)}" title="${statusTitle}">
           <i class="status-dot-sm"></i>
           <span>${status}</span>
         </span>
+        <span class="node-check-time" title="${statusTitle}">${checkedTime}</span>
       </td>
       <td class="col-actions">
         <div class="actions-group">
-          <button class="btn-action" data-action="copy-http" data-id="${item.id}" title="复制该节点 HTTP 代理"${disabled}>HTTP</button>
-          <button class="btn-action" data-action="copy-socks" data-id="${item.id}" title="复制该节点 SOCKS5 代理"${disabled}>S5</button>
-          <button class="btn-action" data-action="test" data-id="${item.id}" title="测试该节点连通性">测速</button>
-          <button class="btn-action" data-action="edit" data-id="${item.id}" title="编辑节点信息">编辑</button>
-          ${toggleAction}
-          <button class="btn-action danger" data-action="remove" data-id="${item.id}" title="删除节点">删除</button>
+          <div class="copy-actions" aria-label="复制代理地址">
+            <button class="btn-action" data-action="copy-http" data-id="${item.id}" title="复制本机 HTTP 地址：127.0.0.1"${disabled}>HTTP</button>
+            <button class="btn-action" data-action="copy-socks" data-id="${item.id}" title="复制本机 SOCKS5 地址：127.0.0.1"${disabled}>SOCKS5</button>
+            <button class="btn-action" data-action="${hy2Configured ? 'copy-hy2' : 'hy2'}" data-id="${item.id}" title="${hy2Configured ? '复制公网 HY2 连接' : '启用公网 HY2'}"${disabled}>${hy2Configured ? 'HY2' : 'HY2 +'}</button>
+            <button class="btn-action" data-action="${realityConfigured ? 'copy-reality' : 'reality'}" data-id="${item.id}" title="${realityConfigured ? '复制 VLESS + RAW + Reality 链接' : '配置 VLESS + RAW + Reality'}"${disabled}>${realityConfigured ? 'VLESS' : 'VLESS +'}</button>
+          </div>
+          <button class="btn-action action-icon" data-action="test" data-id="${item.id}" title="检测上游连通性" aria-label="检测 ${name}"${coreDisabled}>${icon('refresh-cw')}</button>
+          <button class="node-toggle" role="switch" aria-checked="${Boolean(item.enabled)}" data-action="${item.enabled ? 'disable' : 'enable'}" data-id="${item.id}" title="${item.enabled ? '禁用' : '启用'} ${name}" aria-label="启用 ${name}"><span></span></button>
+          <details class="tool-menu row-menu">
+            <summary class="btn-action action-icon" title="更多操作" aria-label="${name} 更多操作">${icon('ellipsis')}</summary>
+            <div class="menu-items">
+              <button data-action="copy-docker-http" data-id="${item.id}"${disabled}>Docker HTTP</button>
+              <button data-action="copy-docker-socks" data-id="${item.id}"${disabled}>Docker SOCKS5</button>
+              <button data-action="copy-public-http" data-id="${item.id}"${disabled}>公网 HTTP</button>
+              <button data-action="copy-public-socks" data-id="${item.id}"${disabled}>公网 SOCKS5</button>
+              ${item.isLocal ? '' : `<button data-action="edit" data-id="${item.id}">编辑节点</button>`}
+              ${item.hy2 ? `<button data-action="${hy2Configured ? 'disable-hy2' : 'hy2'}" data-id="${item.id}"${disabled}>${hy2Configured ? '停用' : '启用'} HY2</button>` : ''}
+              <button data-action="reality" data-id="${item.id}">Reality 设置</button>
+              ${item.isLocal ? '<span class="menu-note">本机节点不可删除</span>' : `<button class="danger" data-action="remove" data-id="${item.id}">删除节点</button>`}
+            </div>
+          </details>
         </div>
       </td>
     </tr>
@@ -302,48 +347,32 @@ function renderRowHtml(item, isChecked) {
  * 局部更新单行 DOM，避免全表重新渲染造成的卡顿和焦点丢失
  * @param {object} item - 最新的节点数据
  */
-function updateSingleRowDom(item) {
+function updateSingleRowDom(item, force = false) {
   const rowElement = document.querySelector(`#row-${item.id}`);
   if (!rowElement) return;
 
-  const checkbox = rowElement.querySelector('.row-select');
-  const wasChecked = checkbox ? checkbox.checked : false;
-  rowElement.outerHTML = renderRowHtml(item, wasChecked);
+  const markup = renderRowHtml(item, selectedNodeIds.has(item.id));
+  if (rowElement.dataset.markup === markup) return;
+  // Keep menus and in-flight actions stable; preserve focus during passive updates.
+  if (!force && rowElement.querySelector('details[open], [data-busy="true"]')) return;
+  const focused = rowElement.contains(document.activeElement) ? document.activeElement : null;
+  const focusSelector = focused?.matches('.row-select') ? '.row-select' : focused?.dataset.action ? `[data-action="${focused.dataset.action}"]` : focused?.matches('summary') ? 'summary' : null;
+  rowElement.outerHTML = markup;
+  const nextRow = document.querySelector(`#row-${item.id}`);
+  nextRow.dataset.markup = markup;
+  if (!force && focusSelector) nextRow.querySelector(focusSelector)?.focus({ preventScroll: true });
   updateSelectionText();
 }
 
 /**
- * 智能自动轮询检查：只要有处于 testing 状态的节点，自动每 1.5 秒更新一次
- * 一旦所有节点测试完成（变为 online 或 offline），自动终止轮询，零多余网络开销
+ * 检测中快速同步，其余时间低频同步；隐藏页面暂停请求
  */
 function checkAutoPolling() {
-  const hasTesting = items.some((it) => it.enabled && it.status === 'testing');
-  if (hasTesting && !autoPollerTimer) {
-    autoPollerTimer = setInterval(async () => {
-      try {
-        const [nextItems, status] = await Promise.all([
-          api('/api/proxies'),
-          api('/api/status')
-        ]);
-        items = nextItems;
-        items.forEach(updateSingleRowDom);
-        updateOverviewCards(status);
-
-        // 如果没有处于 testing 状态的节点了，停止轮询
-        const stillTesting = items.some((it) => it.enabled && it.status === 'testing');
-        if (!stillTesting) {
-          clearInterval(autoPollerTimer);
-          autoPollerTimer = null;
-        }
-      } catch (e) {
-        clearInterval(autoPollerTimer);
-        autoPollerTimer = null;
-      }
-    }, 1500);
-  } else if (!hasTesting && autoPollerTimer) {
-    clearInterval(autoPollerTimer);
-    autoPollerTimer = null;
-  }
+  clearTimeout(autoPollerTimer);
+  autoPollerTimer = null;
+  if (document.hidden || (!autoRefresh.checked && !manualHealthCheck)) return;
+  const testing = manualHealthCheck || items.some((it) => it.enabled && it.status === 'testing');
+  autoPollerTimer = setTimeout(() => refresh(false).catch(() => {}), testing ? 1500 : 15000);
 }
 
 /**
@@ -375,6 +404,8 @@ function updateOverviewCards(status) {
  * @param {Array<object>} listItems - 待渲染节点列表
  */
 function render(listItems) {
+  const existingIds = new Set(listItems.map((item) => item.id));
+  for (const id of selectedNodeIds) if (!existingIds.has(id)) selectedNodeIds.delete(id);
   const selected = selectedIds();
   const filterKeyword = (nodeFilter ? nodeFilter.value : '').trim().toLowerCase();
 
@@ -397,6 +428,7 @@ function render(listItems) {
       </tr>`;
   } else {
     rows.innerHTML = filtered.map((item) => renderRowHtml(item, selected.has(item.id))).join('');
+    filtered.forEach((item) => { document.querySelector(`#row-${item.id}`).dataset.markup = renderRowHtml(item, selected.has(item.id)); });
   }
   updateSelectionText();
   checkAutoPolling();
@@ -439,11 +471,12 @@ function endpoint(item, scheme, host) {
  * @param {string} [label] - 提示文案标签
  */
 async function copyItems(targetItems, scheme, host, label = scheme.toUpperCase()) {
-  const enabledItems = targetItems.filter((item) => item.enabled);
+  const relayField = { hy2: 'hy2', vless: 'reality' }[scheme];
+  const enabledItems = targetItems.filter((item) => item.enabled && (!relayField || (item[relayField]?.status === 'enabled' && item[relayField].link)));
   if (!enabledItems.length) {
-    throw new Error('请先选择至少一个已启用的节点');
+    throw new Error(relayField ? `请选择至少一个已启用 ${label} 的节点` : '请先选择至少一个已启用的节点');
   }
-  const text = enabledItems.map((item) => endpoint(item, scheme, host)).join('\n');
+  const text = enabledItems.map((item) => relayField ? item[relayField].link : endpoint(item, scheme, host)).join('\n');
   await copyText(text);
   showMessage(`已复制 ${enabledItems.length} 个 ${label} 代理节点地址`);
 }
@@ -451,29 +484,55 @@ async function copyItems(targetItems, scheme, host, label = scheme.toUpperCase()
 /**
  * 刷新所有数据（节点、服务状态、配置信息）
  */
-async function refresh() {
-  const [nextItems, status, nextSettings] = await Promise.all([
+async function refresh(includeSettings = true) {
+  if (refreshPromise) {
+    if (!includeSettings) return refreshPromise;
+    await refreshPromise;
+    return refresh(includeSettings);
+  }
+  refreshPromise = refreshData(includeSettings);
+  try { return await refreshPromise; }
+  finally { refreshPromise = null; checkAutoPolling(); }
+}
+
+async function refreshData(includeSettings) {
+  let nextItems, status, nextSettings;
+  try { [nextItems, status, nextSettings] = await Promise.all([
     api('/api/proxies'),
     api('/api/status'),
-    api('/api/settings')
-  ]);
+    includeSettings ? api('/api/settings') : Promise.resolve(settings)
+  ]); } catch (error) {
+    document.querySelector('#syncTime').textContent = '同步失败';
+    throw error;
+  }
+  const previousIds = items.map((item) => item.id).join(',');
   items = nextItems;
   settings = nextSettings;
-  render(items);
+  serviceStatus = status;
+  if (includeSettings || nodeFilter.value.trim() || previousIds !== items.map((item) => item.id).join(',')) render(items);
+  else items.forEach((item) => updateSingleRowDom(item));
 
   // 同步设置表单
+  if (includeSettings && !settingsDialog.open) {
   settingsForm.proxyUsername.value = settings.proxyUsername || '';
   settingsForm.proxyPassword.value = settings.proxyPassword || '';
   settingsForm.publicHost.value = settings.publicHost || '';
   document.querySelector('#subscriptionSocks').value = settings.subscriptions?.socks5 || '';
   document.querySelector('#subscriptionHttp').value = settings.subscriptions?.http || '';
+  }
 
   updateOverviewCards(status);
 
   // 入口地址展示
-  const firstEnabled = items.find((it) => it.enabled);
-  document.querySelector('#endpoint').textContent =
-    `${settings.proxyUsername}@${settings.publicHost || location.hostname}:${firstEnabled ? firstEnabled.listenPort : '40000+'}`;
+  document.querySelector('#endpoint').textContent = getEffectiveHost();
+  document.querySelector('#syncTime').textContent = `同步 ${new Date().toLocaleTimeString('zh-CN', { hour12: false })}`;
+  if (manualHealthCheck && !status.healthCheck?.running) {
+    manualHealthCheck = false;
+    showMessage(status.healthCheck?.lastError || '上游连通性检测完成', Boolean(status.healthCheck?.lastError));
+  }
+  document.querySelector('#testAll').disabled = Boolean(status.healthCheck?.running);
+  document.querySelector('#testAllSpinner').style.display = status.healthCheck?.running ? 'inline-block' : 'none';
+  document.querySelector('#testAllText').textContent = status.healthCheck?.running ? '检测中...' : '检测上游';
 
   updateTotpBadge();
   if (settings.authDisabled) {
@@ -483,6 +542,20 @@ async function refresh() {
   checkAutoPolling();
   return status;
 }
+
+autoRefresh.addEventListener('change', checkAutoPolling);
+document.addEventListener('visibilitychange', () => {
+  checkAutoPolling();
+  if (!document.hidden && (autoRefresh.checked || manualHealthCheck)) refresh(false).catch(() => {});
+});
+document.addEventListener('click', (event) => {
+  document.querySelectorAll('.tool-menu[open]').forEach((menu) => {
+    if (!menu.contains(event.target) || (!menu.classList.contains('docker-menu') && event.target.closest('button, a'))) menu.open = false;
+  });
+});
+document.addEventListener('keydown', (event) => {
+  if (event.key === 'Escape') document.querySelectorAll('.tool-menu[open]').forEach((menu) => { menu.open = false; });
+});
 
 /**
  * 更新顶部导航栏的身份验证器徽章状态
@@ -503,7 +576,213 @@ function updateTotpBadge() {
 document.querySelector('#openAddDialog').addEventListener('click', () => addDialog.showModal());
 document.querySelector('#openImportDialog').addEventListener('click', () => importDialog.showModal());
 document.querySelector('#openSettingsDialog').addEventListener('click', () => settingsDialog.showModal());
+document.querySelector('#openPasswordDialog').addEventListener('click', () => passwordDialog.showModal());
+passwordDialog.addEventListener('close', () => {
+  passwordForm.reset();
+  dialogFeedback(passwordDialog, '');
+});
+async function openRelayModal() {
+  relayDialog.showModal();
+  dialogFeedback(relayDialog, '');
+  try {
+    await refreshRelays();
+  } catch (error) {
+    dialogFeedback(relayDialog, error.message, true);
+  }
+}
+document.querySelector('#openRelayDialog').addEventListener('click', () => openRelayModal());
 document.querySelector('#openTotpDialog').addEventListener('click', () => openTotpModal());
+
+let relayItems = [];
+
+function openRealityModal(item) {
+  realityForm.dataset.id = item.id;
+  realityForm.elements.host.value = item.reality?.host || settings.publicHost || window.location.hostname;
+  realityForm.elements.serverName.value = item.reality?.serverName || 'www.apple.com';
+  realityForm.elements.enabled.checked = item.reality?.enabled ?? item.enabled;
+  document.querySelector('#realityNodeName').textContent = item.name;
+  document.querySelector('#realityPort').textContent = item.reality ? `TCP ${item.reality.listenPort}` : 'TCP 50000+ · 自动分配';
+  document.querySelector('#copyRealityLink').disabled = !item.reality;
+  document.querySelector('#removeReality').hidden = !item.reality;
+  dialogFeedback(realityDialog, '');
+  realityDialog.showModal();
+}
+
+realityForm.addEventListener('submit', async (event) => {
+  event.preventDefault();
+  const button = realityForm.querySelector('[type="submit"]');
+  button.disabled = true;
+  try {
+    const result = await api(`/api/proxies/${realityForm.dataset.id}/reality`, {
+      method: 'PUT', body: JSON.stringify({
+        host: realityForm.elements.host.value, serverName: realityForm.elements.serverName.value,
+        enabled: realityForm.elements.enabled.checked
+      })
+    });
+    await refresh();
+    document.querySelector('#realityPort').textContent = `TCP ${result.listenPort}`;
+    document.querySelector('#copyRealityLink').disabled = false;
+    document.querySelector('#removeReality').hidden = false;
+    dialogFeedback(realityDialog, result.enabled ? 'Reality 已启用' : 'Reality 已停用');
+  } catch (error) { dialogFeedback(realityDialog, error.message, true); }
+  finally { button.disabled = false; }
+});
+
+document.querySelector('#copyRealityLink').addEventListener('click', async () => {
+  try {
+    const item = items.find((entry) => entry.id === realityForm.dataset.id);
+    await copyText(item.reality.link);
+    dialogFeedback(realityDialog, 'VLESS Reality 链接已复制');
+  } catch (error) { dialogFeedback(realityDialog, error.message, true); }
+});
+
+document.querySelector('#removeReality').addEventListener('click', async (event) => {
+  if (!await showConfirm({ title: '删除 Reality 入口', message: '原 VLESS 链接将失效；HTTP、SOCKS5 和 HY2 不受影响。', confirmText: '删除' })) return;
+  event.target.disabled = true;
+  try {
+    await api(`/api/proxies/${realityForm.dataset.id}/reality`, { method: 'DELETE' });
+    await refresh();
+    realityDialog.close();
+    showMessage('Reality 入口已删除');
+  } catch (error) { dialogFeedback(realityDialog, error.message, true); }
+  finally { event.target.disabled = false; }
+});
+
+function setRelayMode() {
+  const auto = relayTlsForm.elements['mode'].value === 'auto';
+  relayTlsForm.querySelectorAll('[data-relay-manual]').forEach((label) => { label.hidden = auto; });
+  for (const name of ['certificatePath', 'keyPath']) relayTlsForm.elements[name].required = !auto;
+  document.querySelector('#relayAcmeHint').hidden = !auto;
+}
+
+relayTlsForm.addEventListener('change', (event) => {
+  if (event.target.name === 'mode') setRelayMode();
+});
+
+function renderRelayCertificateStatus(data) {
+  const status = document.querySelector('#relayCertificateStatus');
+  if (data.tls.mode === 'manual') status.textContent = '使用已有证书';
+  else if (data.tls.status === 'ready') status.textContent = `证书已签发，有效期至 ${new Date(data.tls.expiresAt).toLocaleDateString()}；运行期间自动续期`;
+  else if (data.tls.status === 'not_requested') status.textContent = '尚未申请证书；新增出口后自动申请';
+  else if (data.tls.status === 'error') status.textContent = '签发未完成，sing-box 未运行；请检查服务日志、域名解析及 TCP 443';
+  else status.textContent = '证书申请中；如长时间未完成，请检查服务日志、域名解析及 TCP 443';
+}
+
+let relayStatusPending = false;
+setInterval(async () => {
+  if (document.hidden || relayStatusPending || !relayDialog.open || !relayItems.some((item) => item.enabled)) return;
+  relayStatusPending = true;
+  try { renderRelayCertificateStatus(await api('/api/relays')); } catch (error) { /* next refresh */ }
+  finally { relayStatusPending = false; }
+}, 5000);
+
+function dialogFeedback(dialog, text, error = false) {
+  const feedback = dialog.querySelector('.dialog-feedback');
+  feedback.textContent = text;
+  feedback.classList.toggle('error', error);
+}
+
+async function refreshRelays() {
+  const data = await api('/api/relays');
+  relayItems = data.relays;
+  relayTlsForm.querySelector(`[name="mode"][value="${data.tls.mode}"]`).checked = true;
+  setRelayMode();
+  relayTlsForm.elements['host'].value = data.tls.host;
+  relayTlsForm.elements['certificatePath'].value = data.tls.certificatePath;
+  relayTlsForm.elements['keyPath'].value = data.tls.keyPath;
+  renderRelayCertificateStatus(data);
+  document.querySelector('#relayCoreStatus').textContent =
+    `本项目 sing-box：${data.managedCore ? '运行中' : '未运行'}；VPS sing-box：${data.cores.singBox ? '已检测到' : '未检测到'}；xray：${data.cores.xray ? '已检测到' : '未检测到'}`;
+  document.querySelector('#relayList').innerHTML = relayItems.length
+    ? relayItems.map((item) => `
+      <div class="relay-row">
+        <div class="relay-row-info"><strong>UDP ${item.listenPort} · ${{ enabled: '已启用', disabled: '已停用', node_disabled: '关联节点已停用', unbound: '未关联节点' }[item.status]}</strong>
+          <code>${escapeHtml(item.proxyName || '未关联节点')}</code>
+          <code>${escapeHtml(data.tls.host)}:${item.listenPort}</code></div>
+        <div class="relay-actions">
+          <button class="button secondary btn-sm" type="button" data-relay-action="copy" data-relay-id="${item.id}" title="复制 HY2 连接链接" aria-label="复制 UDP ${item.listenPort} 的连接链接"${item.status === 'unbound' ? ' disabled' : ''}>⧉</button>
+          <button class="button secondary btn-sm" type="button" data-relay-action="${item.enabled ? 'disable' : 'enable'}" data-relay-id="${item.id}"${item.status === 'unbound' ? ' disabled' : ''}>${item.enabled ? '停用' : '启用'}</button>
+          <button class="button danger btn-sm" type="button" data-relay-action="delete" data-relay-id="${item.id}" title="删除 HY2 入口" aria-label="删除 UDP ${item.listenPort} 入口">×</button>
+        </div>
+      </div>`).join('')
+    : '<p class="form-hint">暂无 HY2 出口</p>';
+}
+
+relayTlsForm.addEventListener('submit', async (event) => {
+  event.preventDefault();
+  const button = relayTlsForm.querySelector('[type="submit"]');
+  button.disabled = true;
+  try {
+    await api('/api/relays/tls', {
+      method: 'PUT',
+      body: JSON.stringify({
+        mode: relayTlsForm.elements['mode'].value,
+        host: relayTlsForm.elements['host'].value,
+        certificatePath: relayTlsForm.elements['certificatePath'].value,
+        keyPath: relayTlsForm.elements['keyPath'].value
+      })
+    });
+    await refreshRelays();
+    dialogFeedback(relayDialog, relayTlsForm.elements['mode'].value === 'auto' ? '域名已保存；新增出口后开始申请证书' : 'HY2 TLS 配置已保存');
+  } catch (error) {
+    dialogFeedback(relayDialog, error.message, true);
+  } finally {
+    button.disabled = false;
+  }
+});
+
+document.querySelector('#relayList').addEventListener('click', async (event) => {
+  const button = event.target.closest('[data-relay-action]');
+  if (!button) return;
+  const item = relayItems.find((entry) => entry.id === button.dataset.relayId);
+  if (!item) return;
+  const action = button.dataset.relayAction;
+  if (action === 'copy') {
+    try {
+      await copyText(item.link);
+      dialogFeedback(relayDialog, `UDP ${item.listenPort} 的 HY2 链接已复制`);
+    } catch (error) { dialogFeedback(relayDialog, error.message, true); }
+    return;
+  }
+  if (action === 'delete' && !await showConfirm({ title: '删除 HY2 出口', message: `删除 UDP ${item.listenPort} 后原连接将立即失效。`, confirmText: '删除' })) return;
+  button.disabled = true;
+  try {
+    await api(`/api/relays/${item.id}${action === 'delete' ? '' : `/${action}`}`, {
+      method: action === 'delete' ? 'DELETE' : 'POST'
+    });
+    await Promise.all([refreshRelays(), refresh()]);
+    dialogFeedback(relayDialog, 'HY2 出口已更新');
+  } catch (error) {
+    button.disabled = false;
+    dialogFeedback(relayDialog, error.message, true);
+  }
+});
+
+passwordForm.addEventListener('submit', async (event) => {
+  event.preventDefault();
+  dialogFeedback(passwordDialog, '');
+  const currentPassword = passwordForm.elements['currentPassword'].value;
+  const newPassword = passwordForm.elements['newPassword'].value;
+  if (newPassword !== passwordForm.elements['confirmPassword'].value) {
+    return dialogFeedback(passwordDialog, '两次输入的新密码不一致', true);
+  }
+  const button = passwordForm.querySelector('[type="submit"]');
+  button.disabled = true;
+  try {
+    await api('/api/admin/password', { method: 'POST', body: JSON.stringify({ currentPassword, newPassword }) });
+    passwordForm.reset();
+    if (settings.authDisabled) {
+      passwordDialog.close();
+      showMessage('管理员密码已更新');
+    } else {
+      location.assign('/login');
+    }
+  } catch (error) {
+    dialogFeedback(passwordDialog, error.message, true);
+  } finally {
+    button.disabled = false;
+  }
+});
 
 document.querySelectorAll('[data-close]').forEach((button) => {
   button.addEventListener('click', () => {
@@ -594,6 +873,14 @@ addForm.addEventListener('submit', async (event) => {
   }
 });
 
+document.querySelector('#importFile').addEventListener('change', async (event) => {
+  const file = event.target.files[0];
+  if (!file) return;
+  if (file.size > 120 * 1024) return showMessage('节点文件不能超过 120 KB', true);
+  try { importForm.links.value = await file.text(); }
+  catch (error) { showMessage(`读取节点文件失败: ${error.message}`, true); }
+});
+
 // 批量导入表单提交（毫秒级响应 + 后台自动静默测速）
 importForm.addEventListener('submit', async (event) => {
   event.preventDefault();
@@ -639,7 +926,7 @@ editForm.addEventListener('submit', async (event) => {
     editDialog.close();
     const index = items.findIndex((it) => it.id === id);
     if (index >= 0) items[index] = updated;
-    updateSingleRowDom(updated);
+    updateSingleRowDom(updated, true);
     showMessage(`节点已更新，端口 ${updated.listenPort} 保持不变`);
   } catch (error) {
     showMessage(error.message, true);
@@ -676,37 +963,11 @@ settingsForm.addEventListener('submit', async (event) => {
 });
 
 // 全量手动健康检测
-async function waitForHealthCheck(button, spinner, label, attempt = 0) {
-  try {
-    const status = await refresh();
-    if (!status.healthCheck?.running) {
-      button.disabled = false;
-      if (spinner) spinner.style.display = 'none';
-      button.querySelector('#testAllText').textContent = label;
-      showMessage(status.healthCheck?.lastError || '节点状态已全部刷新完成', Boolean(status.healthCheck?.lastError));
-      return;
-    }
-    if (attempt >= 45) {
-      button.disabled = false;
-      if (spinner) spinner.style.display = 'none';
-      button.querySelector('#testAllText').textContent = label;
-      showMessage('检测仍在后台执行，您可以继续其他操作', false);
-      return;
-    }
-    setTimeout(() => waitForHealthCheck(button, spinner, label, attempt + 1), 1000);
-  } catch (error) {
-    button.disabled = false;
-    if (spinner) spinner.style.display = 'none';
-    button.querySelector('#testAllText').textContent = label;
-    showMessage(error.message, true);
-  }
-}
-
 document.querySelector('#testAll').addEventListener('click', async (event) => {
   const button = event.currentTarget;
   const spinner = button.querySelector('#testAllSpinner');
   const textEl = button.querySelector('#testAllText');
-  const label = textEl.textContent;
+  const label = '检测上游';
 
   button.disabled = true;
   if (spinner) spinner.style.display = 'inline-block';
@@ -714,8 +975,9 @@ document.querySelector('#testAll').addEventListener('click', async (event) => {
 
   try {
     const result = await api('/api/proxies/test-all', { method: 'POST' });
+    manualHealthCheck = true;
     showMessage(result.alreadyRunning ? '检测已在后台运行中' : '已触发全量连通性检测');
-    setTimeout(() => waitForHealthCheck(button, spinner, label), 600);
+    await refresh(false);
   } catch (error) {
     showMessage(error.message, true);
     button.disabled = false;
@@ -728,12 +990,20 @@ document.querySelector('#testAll').addEventListener('click', async (event) => {
 selectAll.addEventListener('change', (event) => {
   document.querySelectorAll('.row-select:not(:disabled)').forEach((checkbox) => {
     checkbox.checked = event.currentTarget.checked;
+    if (checkbox.checked) selectedNodeIds.add(checkbox.dataset.id);
+    else selectedNodeIds.delete(checkbox.dataset.id);
   });
   updateSelectionText();
+});
+document.querySelector('#mobileSelectAll').addEventListener('change', (event) => {
+  selectAll.checked = event.currentTarget.checked;
+  selectAll.dispatchEvent(new Event('change'));
 });
 
 rows.addEventListener('change', (event) => {
   if (event.target.classList.contains('row-select')) {
+    if (event.target.checked) selectedNodeIds.add(event.target.dataset.id);
+    else selectedNodeIds.delete(event.target.dataset.id);
     updateSelectionText();
   }
 });
@@ -745,25 +1015,43 @@ function getSelectedItems() {
 
 // 批量快捷复制
 document.querySelector('#copyHttp').addEventListener('click', () => {
-  copyItems(getSelectedItems(), 'http').catch((error) => showMessage(error.message, true));
+  copyItems(getSelectedItems(), 'http', undefined, '公网 HTTP').catch((error) => showMessage(error.message, true));
 });
 document.querySelector('#copySocks').addEventListener('click', () => {
-  copyItems(getSelectedItems(), 'socks5').catch((error) => showMessage(error.message, true));
+  copyItems(getSelectedItems(), 'socks5', undefined, '公网 SOCKS5').catch((error) => showMessage(error.message, true));
+});
+document.querySelector('#copyHy2').addEventListener('click', () => {
+  copyItems(getSelectedItems(), 'hy2').catch((error) => showMessage(error.message, true));
+});
+document.querySelector('#copyVless').addEventListener('click', () => {
+  copyItems(getSelectedItems(), 'vless', undefined, 'VLESS Reality').catch((error) => showMessage(error.message, true));
 });
 document.querySelector('#copyInternalHttp').addEventListener('click', () => {
-  copyItems(getSelectedItems(), 'http', INTERNAL_PROXY_HOST, '内网 HTTP')
+  copyItems(getSelectedItems(), 'http', INTERNAL_PROXY_HOST, '本机 HTTP')
     .catch((error) => showMessage(error.message, true));
 });
 document.querySelector('#copyInternalSocks').addEventListener('click', () => {
-  copyItems(getSelectedItems(), 'socks5', INTERNAL_PROXY_HOST, '内网 SOCKS5')
+  copyItems(getSelectedItems(), 'socks5', INTERNAL_PROXY_HOST, '本机 SOCKS5')
     .catch((error) => showMessage(error.message, true));
+});
+for (const [id, scheme] of [['copyDockerHttp', 'http'], ['copyDockerSocks', 'socks5']]) {
+  document.querySelector(`#${id}`).addEventListener('click', () => {
+    copyItems(getSelectedItems(), scheme, DOCKER_PROXY_HOST, `Docker ${scheme.toUpperCase()}`)
+      .catch((error) => showMessage(error.message, true));
+  });
+}
+document.querySelector('#copyDockerCompose').addEventListener('click', async () => {
+  try {
+    await copyText(document.querySelector('#dockerComposeSnippet').textContent);
+    showMessage('Compose 服务配置已复制');
+  } catch (error) { showMessage(error.message, true); }
 });
 
 // 批量删除选中的节点（原子事务批量清除并轻量重载）
 const batchDeleteBtn = document.querySelector('#batchDelete');
 if (batchDeleteBtn) {
   batchDeleteBtn.addEventListener('click', async () => {
-    const ids = Array.from(selectedIds());
+    const ids = getSelectedItems().filter((item) => !item.isLocal).map((item) => item.id);
     if (!ids.length) {
       showMessage('请先勾选需要删除的节点', true);
       return;
@@ -789,8 +1077,7 @@ if (batchDeleteBtn) {
       items = items.filter((it) => !deletedSet.has(it.id));
       render(items);
       updateSelectionText();
-      if (selectAll) selectAll.checked = false;
-      api('/api/status').then(updateOverviewCards).catch(() => {});
+      await refresh(false);
     } catch (error) {
       showMessage(`批量删除失败: ${error.message}`, true);
     } finally {
@@ -808,10 +1095,44 @@ rows.addEventListener('click', async (event) => {
   const item = items.find((candidate) => candidate.id === id);
   if (!item) return;
 
-  // 1. 复制
-  if (action === 'copy-http' || action === 'copy-socks') {
+  if (action === 'reality') { openRealityModal(item); return; }
+  if (action === 'copy-reality') {
+    try { await copyText(item.reality.link); showMessage(`已复制 ${item.name} 的 VLESS Reality 出口`); }
+    catch (error) { showMessage(error.message, true); }
+    return;
+  }
+
+  if (action === 'hy2' || action === 'disable-hy2') {
+    button.disabled = true;
     try {
-      await copyItems([item], action === 'copy-http' ? 'http' : 'socks5');
+      await api(item.hy2 ? `/api/relays/${item.hy2.id}/${action === 'disable-hy2' ? 'disable' : 'enable'}` : '/api/relays', {
+        method: 'POST', body: item.hy2 ? undefined : JSON.stringify({ proxyId: item.id })
+      });
+      await refresh();
+      showMessage(`${item.name} HY2 已${action === 'disable-hy2' ? '停用' : '启用'}，端口 ${item.listenPort}`);
+    } catch (error) {
+      await openRelayModal();
+      dialogFeedback(relayDialog, error.message, true);
+    } finally { button.disabled = false; }
+    return;
+  }
+
+  if (action === 'copy-hy2') {
+    try {
+      await copyText(item.hy2.link);
+      showMessage(`已复制 ${item.name || item.server} 的 HY2 出口`);
+    } catch (error) { showMessage(error.message, true); }
+    return;
+  }
+
+  // 1. 复制
+  if (['copy-http', 'copy-socks', 'copy-docker-http', 'copy-docker-socks', 'copy-public-http', 'copy-public-socks'].includes(action)) {
+    try {
+      const docker = action.startsWith('copy-docker-');
+      const external = action.startsWith('copy-public-');
+      const scheme = action.endsWith('http') ? 'http' : 'socks5';
+      await copyItems([item], scheme, docker ? DOCKER_PROXY_HOST : external ? undefined : INTERNAL_PROXY_HOST,
+        `${docker ? 'Docker' : external ? '公网' : '本机'} ${scheme.toUpperCase()}`);
     } catch (error) {
       showMessage(error.message, true);
     }
@@ -843,13 +1164,17 @@ rows.addEventListener('click', async (event) => {
   // 4. 手动单节点测速
   if (action === 'test') {
     button.disabled = true;
-    button.textContent = '测试中...';
+    button.dataset.busy = 'true';
+    button.classList.add('testing-action');
     showMessage(`正在探测 ${item.name || item.server} 连通性...`);
     try {
       const result = await api(`/api/proxies/${id}/test`, { method: 'POST' });
       const index = items.findIndex((it) => it.id === id);
       if (index >= 0) items[index] = result;
-      updateSingleRowDom(result);
+      button.disabled = false;
+      button.blur();
+      updateSingleRowDom(result, true);
+      await refresh(false);
       const isOnline = result.status === 'online';
       showMessage(
         isOnline ? `${result.name} 在线，延迟 ${result.latencyMs} ms` : `${result.name} 离线：${result.lastError || '连接超时'}`,
@@ -858,7 +1183,8 @@ rows.addEventListener('click', async (event) => {
     } catch (error) {
       showMessage(error.message, true);
       button.disabled = false;
-      button.textContent = '测速';
+      delete button.dataset.busy;
+      button.classList.remove('testing-action');
     }
     return;
   }
@@ -866,6 +1192,7 @@ rows.addEventListener('click', async (event) => {
   // 5. 启用 / 禁用 / 删除（毫秒级生效，启用后自动启动静默探测）
   const originalLabel = button.textContent;
   button.disabled = true;
+  button.dataset.busy = 'true';
 
   try {
     const isRemove = action === 'remove';
@@ -875,23 +1202,28 @@ rows.addEventListener('click', async (event) => {
 
     if (isRemove) {
       items = items.filter((it) => it.id !== id);
+      selectedNodeIds.delete(id);
       const rowEl = document.querySelector(`#row-${id}`);
       if (rowEl) rowEl.remove();
+      updateSelectionText();
       showMessage('节点已删除');
     } else {
       const index = items.findIndex((it) => it.id === id);
       if (index >= 0) items[index] = result;
-      updateSingleRowDom(result);
+      button.disabled = false;
+      button.blur();
+      updateSingleRowDom(result, true);
       showMessage(action === 'enable' ? '节点已启用，后台正在自动测速...' : '节点已禁用');
       if (action === 'enable') {
         checkAutoPolling();
       }
     }
 
-    api('/api/status').then(updateOverviewCards).catch(() => {});
+    await refresh(false);
   } catch (error) {
     showMessage(error.message, true);
     button.disabled = false;
+    delete button.dataset.busy;
     button.textContent = originalLabel;
   }
 });
