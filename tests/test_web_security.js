@@ -44,6 +44,18 @@ async function run() {
         assert.strictEqual(loggedIn.status(), 303, 'native browser form must authenticate against the real server');
         await livePage.waitForURL(`${base}/`);
         assert.strictEqual((await live.request.get(`${base}/api/status`)).status(), 200);
+        await livePage.locator('.settings-menu .menu-trigger').click();
+        const setupResponse = livePage.waitForResponse(response => response.url().endsWith('/api/totp/setup'));
+        await livePage.locator('#openTotpDialog').click();
+        const setup = await (await setupResponse).json();
+        const issuer = `ProxyPH-${os.hostname()}`;
+        assert.strictEqual(setup.issuer, issuer);
+        assert.strictEqual(decodeURIComponent(new URL(setup.otpauthUrl).pathname), `/${issuer}:browser-test`);
+        await livePage.locator('#totpQrContainer svg').waitFor();
+        assert.strictEqual(await livePage.locator('#totpSecretText').innerText(), setup.secret);
+        const setupAgain = await (await live.request.get(`${base}/api/totp/setup`)).json();
+        assert.strictEqual(setupAgain.secret, setup.secret, 'Opening setup must preserve the pending secret');
+        await livePage.locator('#totpDialog [data-close]').first().click();
         await live.request.post(`${base}/logout`);
         await livePage.goto(`${base}/login`);
         await livePage.locator('#username').fill('browser-test');

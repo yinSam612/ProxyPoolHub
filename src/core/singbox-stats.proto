@@ -1,0 +1,36 @@
+syntax = "proto3";
+package daemon;
+
+// Connection accounting subset of the sing-box 1.14 StartedService API.
+service StartedService {
+  rpc SubscribeConnections(SubscribeConnectionsRequest) returns (stream ConnectionEvents);
+}
+message SubscribeConnectionsRequest { int64 interval = 1; }
+enum ConnectionEventType {
+  CONNECTION_EVENT_NEW = 0;
+  CONNECTION_EVENT_UPDATE = 1;
+  CONNECTION_EVENT_CLOSED = 2;
+}
+message ConnectionEvents { repeated ConnectionEvent events = 1; bool reset = 2; }
+message ConnectionEvent {
+  ConnectionEventType type = 1;
+  string id = 2;
+  Connection connection = 3;
+  int64 uplinkDelta = 4;
+  int64 downlinkDelta = 5;
+  int64 closedAt = 6;
+}
+message Connection {
+  string id = 1;
+  string inbound = 2;
+  string inboundType = 3;
+  string network = 5;
+  string source = 6;
+  string destination = 7;
+  string domain = 8;
+  int64 createdAt = 12;
+  int64 closedAt = 13;
+  int64 uplinkTotal = 16;
+  int64 downlinkTotal = 17;
+  string outbound = 19;
+}

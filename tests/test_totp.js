@@ -59,5 +59,12 @@ assert.strictEqual(verifyTotp('invalid', testSecret), false);
 const url = buildOtpauthUrl('RelayControl', 'admin', testSecret);
 assert.strictEqual(url.startsWith('otpauth://totp/RelayControl:admin?secret='), true);
 assert.strictEqual(url.includes('issuer=RelayControl'), true);
+for (const hostname of ['vps-us', 'vps-jp', 'server.example.test']) {
+    const issuer = `ProxyPH-${hostname}`;
+    const named = new URL(buildOtpauthUrl(issuer, 'yeyou-ops', testSecret));
+    assert.strictEqual(decodeURIComponent(named.pathname), `/${issuer}:yeyou-ops`);
+    assert.strictEqual(named.searchParams.get('issuer'), issuer);
+    assert.strictEqual(named.searchParams.get('secret'), testSecret);
+}
 
 console.log('✓ All TOTP tests passed successfully.');

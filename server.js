@@ -1,6 +1,7 @@
 'use strict';
 
 const fs = require('fs');
+const { gzipSync } = require('zlib');
 const path = require('path');
 const http = require('http');
 const net = require('net');
@@ -94,6 +95,10 @@ let proxyUser = String(store.settings?.proxyUsername || process.env.PROXY_USERNA
 let proxyPassword = String(store.settings?.proxyPassword || process.env.PROXY_PASSWORD || '');
 const manager = new ProxyManager({
     runtimeDir: RUNTIME_DIR,
+    logDir: path.join(path.dirname(DATA_FILE), 'logs'),
+    trafficFile: path.join(path.dirname(DATA_FILE), 'traffic.json'),
+    ...store.settings.logStorage,
+    clearedBefore: store.settings.logsClearedBefore || 0,
     listenAddress: process.env.PROXY_LISTEN_ADDRESS || '0.0.0.0',
     startPort: BASE_PORT,
     proxyUsername: proxyUser,
@@ -904,6 +909,7 @@ function getFreePort() {
 async function testDisabled(item) {
     const port = await getFreePort();
     const temp = new ProxyManager({
+        logManager: false,
         runtimeDir: RUNTIME_DIR,
         configPath: path.join(RUNTIME_DIR, `test-${item.id}.json`),
         stateFilePath: path.join(RUNTIME_DIR, `test-${item.id}.state.json`),
@@ -1114,10 +1120,36 @@ async function handleApi(request, response, url) {
         const port = Number(url.searchParams.get('port') || 0);
         const keyword = String(url.searchParams.get('keyword') || '').trim();
         const limit = Number(url.searchParams.get('limit') || 100);
-        const logs = manager.logManager ? manager.logManager.getRecentLogs({ port, keyword, limit }) : [];
+        const sort = url.searchParams.get('sort') || '';
+        const order = url.searchParams.get('order') || 'desc';
+        const logs = manager.logManager ? manager.logManager.getRecentLogs({ port, keyword, limit, sort, order }) : [];
         const traffic = manager.logManager ? manager.logManager.getTrafficSummary() : {};
-        const storage = manager.logManager ? manager.logManager.getStorageInfo() : { retentionDays: 30, maxTotalMb: 1024, usedBytes: 0, usedFormatted: '0 B', fileCount: 0 };
-        return sendJson(response, 200, { ok: true, logs, traffic, storage });
+        const storage = manager.logManager ? manager.logManager.getStorageInfo() : { retentionDays: 30, maxTotalMb: 50, usedBytes: 0, usedFormatted: '0 B', fileCount: 0 };
+        const accounting = { status: manager.logManager?.accountingStatus || 'disabled', error: manager.logManager?.accountingError || '' };
+        return sendJson(response, 200, { ok: true, logs, traffic, storage, accounting });
+    }
+    if (url.pathname === '/api/log-settings' && request.method === 'GET') {
+        return sendJson(response, 200, { ...manager.logManager.getStorageInfo(), totpEnabled: Boolean(store.settings.totpEnabled) });
+    }
+    if (url.pathname === '/api/log-settings' && request.method === 'PUT') {
+        const policy = manager.logManager.validateStoragePolicy(await parseBody(request));
+        await exclusive(async () => {
+            store.settings.logStorage = policy;
+            saveStore();
+            await manager.logManager.setStoragePolicy(policy);
+            sendJson(response, 200, manager.logManager.getStorageInfo());
+        });
+        return;
+    }
+    if (url.pathname === '/api/logs/clear' && request.method === 'POST') {
+        if (!await reauthenticate(request, response, await parseBody(request))) return;
+        await exclusive(async () => {
+            const storage = await manager.logManager.clearLogs();
+            store.settings.logsClearedBefore = manager.logManager.clearedBefore;
+            saveStore();
+            sendJson(response, 200, storage);
+        });
+        return;
     }
     if (request.method === 'GET' && url.pathname === '/api/traffic') {
         const traffic = manager.logManager ? manager.logManager.getTrafficSummary() : {};
@@ -1142,12 +1174,13 @@ async function handleApi(request, response, url) {
         const pending = pendingTotp.get(key);
         const secret = pending && pending.expires > Date.now() ? pending.secret : totp.generateSecret();
         pendingTotp.set(key, { secret, expires: Date.now() + 600000 });
-        const otpauthUrl = totp.buildOtpauthUrl('ProxyPoolHub', ADMIN_USER || 'admin', secret);
+        const issuer = `ProxyPH-${os.hostname()}`;
+        const otpauthUrl = totp.buildOtpauthUrl(issuer, ADMIN_USER, secret);
         const qrSvg = generateQrSvg(otpauthUrl);
         return sendJson(response, 200, {
             secret,
-            account: ADMIN_USER || 'admin',
-            issuer: 'ProxyPoolHub',
+            account: ADMIN_USER,
+            issuer,
             otpauthUrl,
             qrSvg,
             enabled: Boolean(store.settings?.totpEnabled)
@@ -1403,6 +1436,8 @@ async function handleApi(request, response, url) {
     sendError(response, 405, 'method not allowed');
 }
 
+const staticFiles = new Map();
+
 function serveStatic(request, response, url) {
     const files = {
         '/': 'index.html',
@@ -1420,14 +1455,40 @@ function serveStatic(request, response, url) {
     }
     const file = path.join(WEB_DIR, name);
     const types = { '.html': 'text/html; charset=utf-8', '.js': 'text/javascript; charset=utf-8', '.css': 'text/css; charset=utf-8', '.svg': 'image/svg+xml' };
-    response.writeHead(200, {
+    const stat = fs.statSync(file);
+    let asset = staticFiles.get(name);
+    if (!asset || asset.mtime !== stat.mtimeMs || asset.size !== stat.size) {
+        const body = fs.readFileSync(file);
+        asset = { mtime: stat.mtimeMs, size: stat.size, body, gzip: gzipSync(body), etag: `W/"${crypto.createHash('sha256').update(body).digest('hex')}"` };
+        staticFiles.set(name, asset);
+    }
+    const cacheable = path.extname(file) !== '.html';
+    const headers = {
         'Content-Type': types[path.extname(file)],
-        'Cache-Control': 'no-store',
+        'Cache-Control': cacheable ? 'private, max-age=0, must-revalidate' : 'no-store',
+        'Vary': 'Accept-Encoding',
         'Content-Security-Policy': "default-src 'self'; script-src 'self'; style-src 'self'; connect-src 'self'; form-action 'self'; frame-ancestors 'none'; base-uri 'none'",
         'X-Content-Type-Options': 'nosniff',
         'X-Frame-Options': 'DENY'
-    });
-    response.end(fs.readFileSync(file));
+    };
+    if (cacheable) {
+        headers.ETag = asset.etag;
+        if (String(request.headers['if-none-match'] || '').split(',').some(value => value.trim() === asset.etag || value.trim() === '*')) {
+            response.writeHead(304, headers);
+            return response.end();
+        }
+    }
+    const encodings = new Map(String(request.headers['accept-encoding'] || '').split(',').map(value => {
+        const [name, ...params] = value.trim().split(';');
+        const quality = params.map(param => param.trim()).find(param => param.startsWith('q='));
+        return [name.toLowerCase(), quality ? Number(quality.slice(2)) : 1];
+    }));
+    const compressed = (encodings.get('gzip') ?? encodings.get('*') ?? 0) > 0;
+    const body = compressed ? asset.gzip : asset.body;
+    if (compressed) headers['Content-Encoding'] = 'gzip';
+    headers['Content-Length'] = body.length;
+    response.writeHead(200, headers);
+    response.end(body);
 }
 
 function serveLogin(response, status = 200, error = '') {

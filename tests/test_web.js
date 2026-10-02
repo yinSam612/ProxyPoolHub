@@ -369,7 +369,7 @@ async function run() {
         assert.ok(await page.locator('#row-local-vps [data-action="copy-reality"]').isDisabled());
         await page.setViewportSize({ width: 1385, height: 946 });
         await page.goto('http://127.0.0.1:3188/logs');
-        assert.strictEqual(await page.locator('.logs-table-wrap').evaluate((element) => getComputedStyle(element).maxHeight), '526px');
+        assert.strictEqual(await page.locator('.logs-table-wrap').evaluate((element) => element.getBoundingClientRect().height), 526);
         assert.deepStrictEqual(errors, []);
         console.log('Web regression passed: batch public VLESS/HY2, host names, internal/public HTTP/SOCKS5, Docker clipboard, Reality settings, polling and desktop/mobile layout.');
     } finally { await browser.close(); }
