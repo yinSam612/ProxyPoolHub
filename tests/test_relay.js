@@ -18,6 +18,7 @@ try {
         keyPath: '/etc/tls/privkey.pem'
     }];
     const config = manager.generateConfig(proxies, relays);
+    assert.ok(!config.route.auto_detect_interface, 'Proxy listeners must use OS routing to reach services on the same VPS');
     assert.deepStrictEqual(config.inbounds[2], {
         type: 'hysteria2',
         tag: 'hy2-relay-example',

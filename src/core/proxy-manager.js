@@ -1411,7 +1411,6 @@ class ProxyManager {
             route: {
                 rules,
                 final: 'direct',
-                auto_detect_interface: true,
                 default_domain_resolver: 'google'
             }
         };
